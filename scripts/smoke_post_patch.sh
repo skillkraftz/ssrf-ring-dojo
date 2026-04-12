@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://localhost:8080"
+BASE="http://localhost:18080"
 
 echo "[*] Health still works"
 curl -s "$BASE/health" | jq .

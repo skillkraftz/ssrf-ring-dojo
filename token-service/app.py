@@ -14,11 +14,13 @@ def health():
 
 @app.get("/.well-known/mesh")
 def mesh():
-    return jsonify({
-        "service": "token-service",
-        "audience": TOKEN_AUDIENCE,
-        "mode": "legacy-internal",
-    })
+    return jsonify(
+        {
+            "service": "token-service",
+            "audience": TOKEN_AUDIENCE,
+            "mode": "legacy-internal",
+        }
+    )
 
 
 @app.get("/mint")
@@ -30,14 +32,23 @@ def mint():
     if aud != TOKEN_AUDIENCE:
         return jsonify({"error": "bad audience"}), 400
 
-    if service != "internal-admin" and provided != SERVICE_SHARED_SECRET:
+    # Authentication is always by shared secret. The previous code
+    # trusted any caller that *claimed* to be "internal-admin" via a
+    # query string, with no proof. That made the mint endpoint a
+    # trivial pivot for any SSRF that could reach this service.
+    # Use a constant-time compare so the secret cannot be timing-leaked.
+    import hmac
+
+    if not hmac.compare_digest(provided, SERVICE_SHARED_SECRET):
         return jsonify({"error": "forbidden"}), 403
 
-    return jsonify({
-        "access_token": "ring-export-token",
-        "audience": TOKEN_AUDIENCE,
-        "issued_to": service or "legacy",
-    })
+    return jsonify(
+        {
+            "access_token": "ring-export-token",
+            "audience": TOKEN_AUDIENCE,
+            "issued_to": service or "legacy",
+        }
+    )
 
 
 if __name__ == "__main__":
