@@ -602,12 +602,40 @@ def admin_metrics():
 
 @app.get("/admin/export")
 def admin_export():
-    if not _check_admin_api_key():
-        return jsonify({"error": "unauthorized"}), 401
-    status, body = _call_internal_admin("/admin/export", "admin:export")
-    return jsonify({"upstream_status": status, "body": body}), (
-        200 if status == 200 else 502
+    # Intentionally removed. The gateway's client credential no longer
+    # holds the admin:export scope, so the export flow runs from a
+    # separate process that holds the "export-job" client credentials.
+    # Returning 410 Gone so that callers who followed the old shape get
+    # a clear signal that the endpoint was deliberately retired, not
+    # broken. See tests/test_identity.py::test_compromised_gateway_cannot_mint_export.
+    return (
+        jsonify(
+            {
+                "error": "gone",
+                "detail": (
+                    "admin:export is no longer served by the gateway. "
+                    "Run the export flow from the dedicated export-job "
+                    "credentials that are not present in the gateway."
+                ),
+            }
+        ),
+        410,
     )
+
+
+@app.post("/_test/reset")
+def _test_reset():
+    """Lab-only: reset the /fetch rate limiter so the regression
+    suite can run repeatably. Gated on APP_ENV=dev AND a header
+    secret. NEVER expose in production."""
+    if os.getenv("APP_ENV", "dev").lower() != "dev":
+        return jsonify({"error": "not available"}), 404
+    expected = os.getenv("TEST_RESET_TOKEN", "dojo-test-reset")
+    provided = request.headers.get("X-Test-Reset-Token", "")
+    if not hmac.compare_digest(provided, expected):
+        return jsonify({"error": "forbidden"}), 403
+    _rate_limiter.reset()
+    return jsonify({"ok": True})
 
 
 @app.get("/admin/debug-config")

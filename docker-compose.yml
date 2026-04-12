@@ -34,6 +34,12 @@ services:
       JWKS_URL: http://token-service:5003/.well-known/jwks.json
       JWKS_CACHE_TTL_SECONDS: 300
       JTI_CACHE_TTL_SECONDS: 300
+      # Fingerprint pinning. If any future JWKS fetch returns a key
+      # whose raw bytes do not hash to this value, the response is
+      # rejected. Defends against JWKS-MitM on a hostile docker bridge
+      # where an attacker with CAP_NET_RAW could ARP-spoof token-service.
+      EXPECTED_JWKS_KEY_SHA256: 9dd6f1aade2123e61705f2db001903284666e81d6331a58c86936f89659ba419
+      JWKS_REFRESH_MIN_INTERVAL_SECONDS: 10
     depends_on:
       - token-service
     expose:
@@ -59,6 +65,12 @@ services:
       # how chatty mint is.
       TOKEN_TTL_SECONDS: 5
       TIMESTAMP_SKEW_SECONDS: 30
+      # Per-client mint rate limit. Normal test-suite flow uses ~20
+      # mints in <1s from each client, so a burst of 30 + 1/sec refill
+      # is comfortable. A compromised gateway mint-spamming will bump
+      # into this within seconds.
+      MINT_RATE_LIMIT_PER_MINUTE: 60
+      MINT_RATE_LIMIT_BURST: 30
       # Fixed Ed25519 signing key for the lab. NEVER reuse in
       # production - generate a fresh key per environment and store
       # in a secret manager. Pinning the key here means the JWKS

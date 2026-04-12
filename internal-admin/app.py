@@ -38,6 +38,7 @@ Endpoint summary
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import time
@@ -61,6 +62,19 @@ EXPECTED_AUDIENCE = os.getenv("EXPECTED_AUDIENCE", "internal-admin")
 JWKS_URL = os.getenv("JWKS_URL", "http://token-service:5003/.well-known/jwks.json")
 JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "300"))
 JTI_CACHE_TTL_SECONDS = int(os.getenv("JTI_CACHE_TTL_SECONDS", "300"))
+# Optional: pin the expected SHA-256 of the Ed25519 public key bytes.
+# If set, any JWKS response whose key does not hash to this value is
+# rejected, even if the response is otherwise well-formed. This closes
+# the JWKS-MitM window that plaintext inter-service HTTP would leave
+# open on a hostile network.
+EXPECTED_JWKS_KEY_SHA256 = os.getenv("EXPECTED_JWKS_KEY_SHA256", "").strip().lower()
+# Minimum interval between JWKS refresh attempts. Used when the
+# verifier tries to recover from a signature failure (e.g. after a
+# key rotation at token-service). Prevents an attacker from triggering
+# a refresh on every bad token they send.
+JWKS_REFRESH_MIN_INTERVAL_SECONDS = float(
+    os.getenv("JWKS_REFRESH_MIN_INTERVAL_SECONDS", "10")
+)
 APP_ENV = os.getenv("APP_ENV", "dev").lower()
 SIGNING_ALG = "EdDSA"
 
@@ -77,23 +91,49 @@ class AuthError(Exception):
 
 
 class _JWKSCache:
-    def __init__(self, url: str, ttl: int):
+    def __init__(self, url: str, ttl: int, expected_sha256: str = ""):
         self._url = url
         self._ttl = ttl
+        self._expected_sha256 = expected_sha256
         self._key_pem: bytes | None = None
         self._fetched_at = 0.0
+        self._last_refresh_attempt = 0.0
         self._lock = Lock()
 
     def get(self) -> bytes:
+        """Return the current cached public key PEM, fetching if the
+        cache has expired or is empty."""
         now = time.monotonic()
         with self._lock:
             if self._key_pem is not None and (now - self._fetched_at) < self._ttl:
                 return self._key_pem
-            self._key_pem = self._fetch()
+            self._key_pem = self._fetch_locked()
             self._fetched_at = now
+            self._last_refresh_attempt = now
             return self._key_pem
 
-    def _fetch(self) -> bytes:
+    def maybe_refresh(self) -> bool:
+        """Force-refresh the key, but only if we haven't already tried
+        very recently. Returns True if a refresh actually happened and
+        produced a different key from what was cached before."""
+        now = time.monotonic()
+        with self._lock:
+            if (now - self._last_refresh_attempt) < JWKS_REFRESH_MIN_INTERVAL_SECONDS:
+                return False
+            previous = self._key_pem
+            try:
+                self._key_pem = self._fetch_locked()
+                self._fetched_at = now
+            except Exception as exc:
+                log.warning("jwks refresh failed: %s", exc)
+                self._last_refresh_attempt = now
+                return False
+            self._last_refresh_attempt = now
+            return self._key_pem != previous
+
+    def _fetch_locked(self) -> bytes:
+        """Fetch the JWKS. Caller must hold self._lock. Raises on
+        parse failure or fingerprint mismatch."""
         resp = requests.get(self._url, timeout=3)
         resp.raise_for_status()
         data = resp.json()
@@ -105,6 +145,24 @@ class _JWKSCache:
             ):
                 x_b64 = k["x"] + "=" * (-len(k["x"]) % 4)
                 raw = base64.urlsafe_b64decode(x_b64)
+
+                # Fingerprint pinning. If the operator set
+                # EXPECTED_JWKS_KEY_SHA256, any deviation -- whether
+                # from a legitimate rotation or a hostile substitution --
+                # is a hard failure. This closes the JWKS-MitM window
+                # that plaintext inter-service HTTP leaves open on a
+                # hostile docker bridge where an attacker with
+                # CAP_NET_RAW could ARP-spoof token-service.
+                if self._expected_sha256:
+                    actual = hashlib.sha256(raw).hexdigest()
+                    if actual != self._expected_sha256:
+                        log.error(
+                            "JWKS fingerprint mismatch expected=%s actual=%s",
+                            self._expected_sha256,
+                            actual,
+                        )
+                        raise RuntimeError("jwks fingerprint mismatch")
+
                 pub = Ed25519PublicKey.from_public_bytes(raw)
                 return pub.public_bytes(
                     encoding=serialization.Encoding.PEM,
@@ -118,7 +176,7 @@ class _JWKSCache:
             self._fetched_at = 0.0
 
 
-JWKS_CACHE = _JWKSCache(JWKS_URL, JWKS_CACHE_TTL_SECONDS)
+JWKS_CACHE = _JWKSCache(JWKS_URL, JWKS_CACHE_TTL_SECONDS, EXPECTED_JWKS_KEY_SHA256)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +218,26 @@ JTI_CACHE = _JTICache(JTI_CACHE_TTL_SECONDS)
 # ---------------------------------------------------------------------------
 
 
+def _decode_token(token: str, public_key: bytes) -> dict:
+    return jwt.decode(
+        token,
+        public_key,
+        algorithms=[SIGNING_ALG],
+        audience=EXPECTED_AUDIENCE,
+        issuer=EXPECTED_ISSUER,
+        options={
+            "require": ["exp", "iat", "iss", "aud", "jti", "sub"],
+            "verify_signature": True,
+            "verify_exp": True,
+            "verify_iat": True,
+            "verify_nbf": True,
+            "verify_aud": True,
+            "verify_iss": True,
+        },
+        leeway=2,
+    )
+
+
 def _verify_jwt_and_scope(required_scope: str) -> dict:
     auth = request.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -171,23 +249,22 @@ def _verify_jwt_and_scope(required_scope: str) -> dict:
     public_key = JWKS_CACHE.get()
 
     try:
-        claims = jwt.decode(
-            token,
-            public_key,
-            algorithms=[SIGNING_ALG],
-            audience=EXPECTED_AUDIENCE,
-            issuer=EXPECTED_ISSUER,
-            options={
-                "require": ["exp", "iat", "iss", "aud", "jti", "sub"],
-                "verify_signature": True,
-                "verify_exp": True,
-                "verify_iat": True,
-                "verify_nbf": True,
-                "verify_aud": True,
-                "verify_iss": True,
-            },
-            leeway=2,
-        )
+        claims = _decode_token(token, public_key)
+    except jwt.InvalidSignatureError:
+        # Signature mismatch can mean the key was rotated at
+        # token-service. Refresh the JWKS once (rate-limited) and try
+        # again. Any OTHER kind of InvalidTokenError (expired, wrong
+        # aud, missing claim) is a permanent failure and does NOT
+        # trigger a refresh -- that would let an attacker spam the
+        # refresh rate limit with bad tokens.
+        if JWKS_CACHE.maybe_refresh():
+            try:
+                claims = _decode_token(token, JWKS_CACHE.get())
+                log.info("jwks refresh recovered a signature failure")
+            except jwt.InvalidTokenError as exc:
+                raise AuthError(f"invalid token: {exc}") from exc
+        else:
+            raise AuthError("invalid token: Signature verification failed")
     except jwt.InvalidTokenError as exc:
         raise AuthError(f"invalid token: {exc}") from exc
 

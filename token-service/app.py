@@ -67,6 +67,13 @@ KEY_ID = "token-service-1"
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "60"))
 TIMESTAMP_SKEW_SECONDS = int(os.getenv("TIMESTAMP_SKEW_SECONDS", "30"))
 
+# Per-client mint rate limit. Applied AFTER the HMAC check so unknown
+# or badly-authenticated clients cannot consume budget (no free grief).
+# Defaults sized for the normal test flow (~20 mints in <1s) to not
+# trip the limiter, but a compromised gateway mint-spamming will.
+MINT_RATE_LIMIT_PER_MINUTE = int(os.getenv("MINT_RATE_LIMIT_PER_MINUTE", "60"))
+MINT_RATE_LIMIT_BURST = int(os.getenv("MINT_RATE_LIMIT_BURST", "30"))
+
 
 # ---------------------------------------------------------------------------
 # Per-client policy
@@ -97,11 +104,29 @@ def _load_clients() -> dict:
 
     if not data:
         # Lab defaults. NEVER reuse these in production.
+        #
+        # Policy split: the gateway runs the public-facing surface and
+        # is the most likely container to be compromised. It is therefore
+        # granted ONLY the scopes it needs for its legitimate operator
+        # dashboards (metrics and debug). The admin:export scope, which
+        # reads customer PII, lives on a separate client identity
+        # (export-job) whose credentials are deliberately NOT stored in
+        # the gateway container. A compromise of gateway therefore
+        # cannot exfiltrate via /admin/export.
         data = {
             "gateway": {
                 "secret": "gateway-client-secret-do-not-reuse",
                 "allowed_audiences": ["internal-admin"],
-                "allowed_scopes": ["metrics:read", "admin:export", "debug:read"],
+                "allowed_scopes": ["metrics:read", "debug:read"],
+            },
+            "export-job": {
+                # This client represents a separate process (batch job,
+                # dedicated worker, admin CLI, etc.) that owns the
+                # sensitive export flow. Its secret is NOT present in
+                # gateway's environment.
+                "secret": "export-job-secret-do-not-reuse",
+                "allowed_audiences": ["internal-admin"],
+                "allowed_scopes": ["admin:export"],
             },
             "metrics-only-client": {
                 # Demonstrates per-client scope restriction. Has valid
@@ -189,6 +214,55 @@ NONCE_CACHE = _NonceCache(TIMESTAMP_SKEW_SECONDS * 4)
 
 
 # ---------------------------------------------------------------------------
+# Per-client mint rate limit (token bucket, in-process)
+# ---------------------------------------------------------------------------
+
+
+class _MintRateLimiter:
+    """Token bucket keyed on client_id. A compromised client can still
+    mint up to ``burst`` fresh tokens, but sustained abuse is capped at
+    ``per_minute / 60`` per second. This bounds the JTI-cache pressure
+    a single compromised client can inflict on downstream verifiers and
+    makes log-based detection of abuse much easier."""
+
+    def __init__(self, per_minute: int, burst: int):
+        self._burst = float(max(1, burst))
+        self._refill_per_sec = max(0.0, per_minute) / 60.0
+        self._buckets: dict[str, list] = {}
+        self._lock = Lock()
+
+    def allow(self, client_id: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            # Evict stale buckets when the dict gets big. A stale
+            # bucket is one whose tokens are already full.
+            if len(self._buckets) > 1000:
+                self._buckets = {
+                    k: v
+                    for k, v in self._buckets.items()
+                    if v[0] + (now - v[1]) * self._refill_per_sec < self._burst
+                }
+            entry = self._buckets.get(client_id)
+            if entry is None:
+                tokens, last = self._burst, now
+            else:
+                tokens, last = entry
+                tokens = min(self._burst, tokens + (now - last) * self._refill_per_sec)
+            if tokens < 1.0:
+                self._buckets[client_id] = [tokens, now]
+                return False
+            self._buckets[client_id] = [tokens - 1.0, now]
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+
+MINT_RATE_LIMITER = _MintRateLimiter(MINT_RATE_LIMIT_PER_MINUTE, MINT_RATE_LIMIT_BURST)
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -196,6 +270,23 @@ NONCE_CACHE = _NonceCache(TIMESTAMP_SKEW_SECONDS * 4)
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "token-service"})
+
+
+@app.post("/_test/reset")
+def _test_reset():
+    """Lab-only reset of the rate limiter and nonce cache, gated on
+    APP_ENV=dev AND a header-shared secret. NEVER expose in production.
+    This exists so the regression suite can exercise rate-limit
+    behavior deterministically without depending on elapsed wall-clock
+    time between test runs."""
+    if os.getenv("APP_ENV", "dev").lower() != "dev":
+        return jsonify({"error": "not available"}), 404
+    expected = os.getenv("TEST_RESET_TOKEN", "dojo-test-reset")
+    if not hmac.compare_digest(request.headers.get("X-Test-Reset-Token", ""), expected):
+        return jsonify({"error": "forbidden"}), 403
+    MINT_RATE_LIMITER.reset()
+    NONCE_CACHE.reset()
+    return jsonify({"ok": True})
 
 
 @app.get("/.well-known/jwks.json")
@@ -273,13 +364,21 @@ def mint_v2():
         log.warning("mint denied: bad signature client_id=%s", client_id)
         return jsonify({"error": "bad signature"}), 401
 
-    # 5. Only NOW do we burn a nonce. This means an attacker without
+    # 5. Per-client rate limit. Placed AFTER signature verification so
+    # an unauthenticated attacker cannot exhaust another client's bucket
+    # by forging their client_id. Placed BEFORE the nonce burn so that
+    # a rate-limited request does not consume a nonce slot.
+    if not MINT_RATE_LIMITER.allow(client_id):
+        log.warning("mint denied: rate limit client_id=%s", client_id)
+        return jsonify({"error": "rate limit exceeded"}), 429
+
+    # 6. Only NOW do we burn a nonce. This means an attacker without
     # the secret cannot grief by exhausting the nonce cache.
     if not NONCE_CACHE.remember(f"{client_id}:{nonce}"):
         log.warning("mint denied: replayed nonce client_id=%s", client_id)
         return jsonify({"error": "nonce already used"}), 401
 
-    # 6. Validate the request body
+    # 7. Validate the request body
     body = request.get_json(silent=True) or {}
     audience = body.get("audience", "")
     scopes = body.get("scopes", [])
@@ -314,7 +413,7 @@ def mint_v2():
         )
         return jsonify({"error": f"scopes not permitted: {sorted(forbidden)}"}), 403
 
-    # 7. Issue the JWT
+    # 8. Issue the JWT
     iat = int(time.time())
     exp = iat + TOKEN_TTL_SECONDS
     jti = secrets.token_urlsafe(16)
