@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://localhost:8080"
+BASE="${BASE:-http://localhost:18080}"
 
 cleanup() {
   rm -f /tmp/dojo_mint.json /tmp/dojo_export.json

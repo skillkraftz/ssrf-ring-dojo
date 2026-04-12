@@ -21,8 +21,8 @@ services:
     environment:
       APP_ENV: dev
       INTERNAL_API_KEY: super-secret-internal-key
-      EXPORT_TOKEN: ring-export-token
       MINT_AUDIENCE: internal-admin-export
+      EXPORT_SIGNING_SECRET: dojo-export-signing-secret
     expose:
       - "5001"
     networks:
@@ -43,6 +43,7 @@ services:
       APP_ENV: dev
       TOKEN_AUDIENCE: internal-admin-export
       SERVICE_SHARED_SECRET: dojo-shared-secret
+      EXPORT_SIGNING_SECRET: dojo-export-signing-secret
     expose:
       - "5003"
     networks:

@@ -1,36 +1,90 @@
 from flask import Flask, request, jsonify
+import ipaddress
 import os
 import requests
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 app = Flask(__name__)
-ALLOWED_PROXY_HOSTS = {h.strip() for h in os.getenv("ALLOWED_PROXY_HOSTS", "internal-admin").split(",") if h.strip()}
-ALLOWED_PROXY_URLS = {u.strip() for u in os.getenv("ALLOWED_PROXY_URLS", "http://internal-admin:5001/health").split(",") if u.strip()}
+ALLOWED_PROXY_HOSTS = {
+    h.strip()
+    for h in os.getenv("ALLOWED_PROXY_HOSTS", "internal-admin").split(",")
+    if h.strip()
+}
+ALLOWED_PROXY_URLS = {
+    u.strip()
+    for u in os.getenv("ALLOWED_PROXY_URLS", "http://internal-admin:5001/health").split(
+        ","
+    )
+    if u.strip()
+}
 REQUEST_TIMEOUT = 3
+MAX_REDIRECTS = 5
 
 
-def resolve_host(host: str):
+class UnsafeTargetError(ValueError):
+    pass
+
+
+def resolve_addresses(host: str):
     try:
-        return socket.gethostbyname(host)
-    except Exception:
-        return None
+        info = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise UnsafeTargetError("unresolvable host") from exc
+
+    addresses = set()
+    for _, _, _, _, sockaddr in info:
+        raw_ip = sockaddr[0].split("%", 1)[0]
+        addresses.add(ipaddress.ip_address(raw_ip))
+
+    if not addresses:
+        raise UnsafeTargetError("unresolvable host")
+
+    return addresses
 
 
-def weak_is_blocked_target(parsed) -> bool:
-    hostname = (parsed.hostname or "").lower()
-    netloc = (parsed.netloc or "").lower()
-    if not hostname:
-        return True
-    # Intentionally weak: compares raw netloc strings, so userinfo forms such as
-    # gateway@internal-admin:5001 bypass the check. Only blocks one internal
-    # service directly, ignores token-service, redirector, RFC1918, and redirects.
-    blocked_netlocs = {
-        "localhost",
-        "localhost:5000",
-        "internal-admin:5001",
-    }
-    return netloc in blocked_netlocs
+def validate_external_url(target: str):
+    parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeTargetError("bad scheme")
+
+    if not parsed.hostname:
+        raise UnsafeTargetError("missing hostname")
+
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise UnsafeTargetError("bad port") from exc
+
+    addresses = resolve_addresses(parsed.hostname)
+    if any(not address.is_global for address in addresses):
+        raise UnsafeTargetError("blocked internal address")
+
+    return parsed
+
+
+def safe_fetch(target: str):
+    current = target
+
+    with requests.Session() as session:
+        session.trust_env = False
+
+        for _ in range(MAX_REDIRECTS + 1):
+            validate_external_url(current)
+            response = session.get(
+                current, timeout=REQUEST_TIMEOUT, allow_redirects=False
+            )
+
+            if not response.is_redirect:
+                return response
+
+            location = response.headers.get("Location")
+            if not location:
+                return response
+
+            current = urljoin(response.url, location)
+
+    raise UnsafeTargetError("too many redirects")
 
 
 @app.get("/health")
@@ -44,25 +98,25 @@ def fetch():
     if not target:
         return jsonify({"error": "missing url"}), 400
 
-    parsed = urlparse(target)
-    if parsed.scheme not in ("http", "https"):
-        return jsonify({"error": "bad scheme"}), 400
-
-    if weak_is_blocked_target(parsed):
-        return jsonify({"error": "blocked hostname"}), 403
-
-    resolved = resolve_host(parsed.hostname) if parsed.hostname else None
-    if resolved and (resolved.startswith("127.") or resolved == "::1"):
-        return jsonify({"error": "blocked localhost"}), 403
-
     try:
-        r = requests.get(target, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        return jsonify({
-            "status_code": r.status_code,
-            "content_type": r.headers.get("Content-Type"),
-            "body": r.text[:1200],
-            "final_url": r.url,
-        })
+        r = safe_fetch(target)
+        return jsonify(
+            {
+                "status_code": r.status_code,
+                "content_type": r.headers.get("Content-Type"),
+                "body": r.text[:1200],
+                "final_url": r.url,
+            }
+        )
+    except UnsafeTargetError as exc:
+        message = str(exc)
+        status_code = (
+            400
+            if message
+            in {"bad scheme", "missing hostname", "bad port", "unresolvable host"}
+            else 403
+        )
+        return jsonify({"error": message}), status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
