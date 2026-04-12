@@ -12,7 +12,7 @@ curl -s "$BASE/proxy-health" | jq .
 
 echo
 echo "[*] Explicit allowlisted proxy still works for the single intended URL"
-curl -s "$BASE/proxy-allowlisted?target=http://internal-admin:5001/health" | jq .
+curl -s "$BASE/proxy-allowlisted?target=https://internal-admin:5001/health" | jq .
 
 echo
 echo "[*] Direct SSRF should now be blocked"

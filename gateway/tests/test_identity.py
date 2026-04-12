@@ -31,27 +31,52 @@ import secrets
 import time
 
 import jwt as pyjwt
+import pytest
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-GATEWAY_BASE = "http://127.0.0.1:5000"
-TOKEN_SERVICE_BASE = "http://token-service:5003"
-INTERNAL_ADMIN_BASE = "http://internal-admin:5001"
+GATEWAY_BASE = "http://127.0.0.1:5000"  # external surface, still HTTP
+# Internal surfaces are now HTTPS and require mTLS.
+TOKEN_SERVICE_BASE = "https://token-service:5003"
+INTERNAL_ADMIN_BASE = "https://internal-admin:5001"
 ADMIN_API_KEY = "lab-admin-key-rotate-me"
+
+# mTLS material. Tests run inside the gateway container which has the
+# gateway cert at /certs; we present it as our client cert. The
+# transport identity is always "gateway" regardless of which logical
+# client_id the test is impersonating at the HMAC/JWT layer.
+CA_FILE = "/certs/ca.crt"
+CLIENT_CERT = "/certs/gateway.crt"
+CLIENT_KEY = "/certs/gateway.key"
+_CLIENT_CERT_TUPLE = (CLIENT_CERT, CLIENT_KEY)
+
+
+def _mtls_session() -> requests.Session:
+    s = requests.Session()
+    s.cert = _CLIENT_CERT_TUPLE
+    s.verify = CA_FILE
+    return s
+
+
+# Module-level session so tests reuse the TLS connection pool.
+_S = _mtls_session()
+
 
 # These mirror token-service's lab default policy.
 #
-# IMPORTANT: the EXPORT_JOB credentials are intentionally NOT present in
-# the gateway container's runtime environment in production. They live
-# here in the test file so we can exercise the legitimate export flow
-# from the test harness; a real deployment would run the export flow
-# from a dedicated worker/batch container whose secrets never touch the
-# gateway. This file is a lab artifact.
+# IMPORTANT: the EXPORT_JOB, DEBUG_CLIENT, and GATEWAY credentials are
+# intentionally NOT all present in the gateway container's runtime
+# environment in production. They live here in the test file so we can
+# exercise the legitimate flows from the test harness; a real deployment
+# would run each flow from a dedicated worker/tool container whose
+# secrets never touch the gateway. This file is a lab artifact.
 GATEWAY_CLIENT_ID = "gateway"
 GATEWAY_CLIENT_SECRET = "gateway-client-secret-do-not-reuse"
 EXPORT_JOB_CLIENT_ID = "export-job"
 EXPORT_JOB_CLIENT_SECRET = "export-job-secret-do-not-reuse"
+DEBUG_CLIENT_ID = "debug-client"
+DEBUG_CLIENT_SECRET = "debug-client-secret-do-not-reuse"
 METRICS_ONLY_CLIENT_ID = "metrics-only-client"
 METRICS_ONLY_CLIENT_SECRET = "metrics-only-secret-do-not-reuse"
 
@@ -94,7 +119,7 @@ def _mint(
     }
     for h in drop_headers:
         headers.pop(h, None)
-    return requests.post(
+    return _S.post(
         f"{TOKEN_SERVICE_BASE}/v2/mint",
         json={"audience": audience, "scopes": scopes},
         headers=headers,
@@ -114,7 +139,7 @@ def _good_token(audience="internal-admin", scopes=("metrics:read",)) -> str:
 
 
 def test_jwks_endpoint_publishes_ed25519_key():
-    r = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
+    r = _S.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
     assert r.status_code == 200
     keys = r.json()["keys"]
     assert len(keys) >= 1
@@ -144,7 +169,7 @@ def test_mint_v2_legitimate_request_works():
 
 def test_internal_admin_metrics_with_legit_jwt_works():
     token = _good_token(scopes=("metrics:read",))
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
@@ -165,7 +190,7 @@ def test_internal_admin_export_with_legit_export_job_jwt_works():
     )
     assert r.status_code == 200, r.text
     token = r.json()["token"]
-    r2 = requests.get(
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
@@ -176,19 +201,30 @@ def test_internal_admin_export_with_legit_export_job_jwt_works():
     assert payload["data"] == "sensitive export"
 
 
-def test_internal_admin_debug_config_with_legit_jwt_works():
-    token = _good_token(scopes=("debug:read",))
-    r = requests.get(
+def test_internal_admin_debug_config_with_legit_debug_client_jwt_works():
+    """Debug access now comes from the dedicated debug-client identity,
+    not from gateway. This mirrors the export-job pattern: gateway's
+    policy is pinned to metrics:read only; sensitive scopes live on
+    separate client identities whose credentials never touch gateway."""
+    r = _mint(
+        audience="internal-admin",
+        scopes=["debug:read"],
+        client_id=DEBUG_CLIENT_ID,
+        client_secret=DEBUG_CLIENT_SECRET,
+    )
+    assert r.status_code == 200, r.text
+    token = r.json()["token"]
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/debug/config",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
     )
-    assert r.status_code == 200
-    assert r.json()["caller"] == GATEWAY_CLIENT_ID
+    assert r2.status_code == 200
+    assert r2.json()["caller"] == DEBUG_CLIENT_ID
 
 
 def test_gateway_admin_metrics_end_to_end():
-    r = requests.get(
+    r = _S.get(
         f"{GATEWAY_BASE}/admin/metrics",
         headers={"X-Admin-Api-Key": ADMIN_API_KEY},
         timeout=5,
@@ -209,24 +245,41 @@ def test_gateway_admin_export_is_retired():
         {"X-Admin-Api-Key": ADMIN_API_KEY},
         {"X-Admin-Api-Key": "wrong-key"},
     ):
-        r = requests.get(f"{GATEWAY_BASE}/admin/export", headers=headers, timeout=3)
+        r = _S.get(f"{GATEWAY_BASE}/admin/export", headers=headers, timeout=3)
         assert r.status_code == 410, f"expected 410 with headers={headers}"
         payload = r.json()
         assert "gone" in payload.get("error", "").lower()
 
 
-def test_gateway_admin_endpoints_require_admin_api_key():
-    # /admin/export is deliberately excluded: it's 410 Gone for
-    # everyone, which is covered by test_gateway_admin_export_is_retired.
-    for path in ("/admin/metrics", "/admin/debug-config"):
-        r = requests.get(f"{GATEWAY_BASE}{path}", timeout=3)
-        assert r.status_code == 401
-        r2 = requests.get(
-            f"{GATEWAY_BASE}{path}",
-            headers={"X-Admin-Api-Key": "wrong-key"},
+def test_gateway_admin_debug_config_is_retired():
+    """Just like /admin/export, /admin/debug-config is retired from
+    gateway because gateway's policy no longer holds debug:read. It
+    must return 410 Gone for all credentials."""
+    for headers in (
+        {},
+        {"X-Admin-Api-Key": ADMIN_API_KEY},
+        {"X-Admin-Api-Key": "wrong-key"},
+    ):
+        r = _S.get(
+            f"{GATEWAY_BASE}/admin/debug-config",
+            headers=headers,
             timeout=3,
         )
-        assert r2.status_code == 401
+        assert r.status_code == 410, f"expected 410 with headers={headers}"
+        assert "gone" in r.json().get("error", "").lower()
+
+
+def test_gateway_admin_metrics_requires_admin_api_key():
+    """/admin/metrics is the only live admin endpoint on the gateway.
+    It must still require ADMIN_API_KEY."""
+    r = _S.get(f"{GATEWAY_BASE}/admin/metrics", timeout=3)
+    assert r.status_code == 401
+    r2 = _S.get(
+        f"{GATEWAY_BASE}/admin/metrics",
+        headers={"X-Admin-Api-Key": "wrong-key"},
+        timeout=3,
+    )
+    assert r2.status_code == 401
 
 
 # ===========================================================================
@@ -235,7 +288,7 @@ def test_gateway_admin_endpoints_require_admin_api_key():
 
 
 def test_mint_v2_no_client_credentials_blocked():
-    r = requests.post(
+    r = _S.post(
         f"{TOKEN_SERVICE_BASE}/v2/mint",
         json={"audience": "internal-admin", "scopes": ["metrics:read"]},
         timeout=3,
@@ -399,12 +452,12 @@ def test_mint_v2_partial_scope_subset_blocked():
 
 
 def test_internal_admin_no_bearer_blocked():
-    r = requests.get(f"{INTERNAL_ADMIN_BASE}/internal/metrics", timeout=3)
+    r = _S.get(f"{INTERNAL_ADMIN_BASE}/internal/metrics", timeout=3)
     assert r.status_code == 401
 
 
 def test_internal_admin_garbage_bearer_blocked():
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": "Bearer not.a.jwt"},
         timeout=3,
@@ -416,7 +469,7 @@ def test_internal_admin_wrong_scope_blocked():
     """A token minted for metrics:read cannot be used to access
     /admin/export which requires admin:export."""
     token = _good_token(scopes=("metrics:read",))
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
@@ -429,13 +482,13 @@ def test_internal_admin_jti_replay_blocked():
     """A token is single-use at the verifier. Re-presenting the same
     token returns 401 with a replay error."""
     token = _good_token(scopes=("metrics:read",))
-    r1 = requests.get(
+    r1 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
     )
     assert r1.status_code == 200
-    r2 = requests.get(
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
@@ -474,7 +527,7 @@ def test_internal_admin_wrong_audience_blocked():
         algorithm="EdDSA",
         headers={"kid": "token-service-1", "typ": "JWT"},
     )
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {forged}"},
         timeout=3,
@@ -497,7 +550,7 @@ def test_internal_admin_expired_jwt_blocked():
     """
     # First, prove the token works freshly
     t1 = _good_token(scopes=("metrics:read",))
-    r1 = requests.get(
+    r1 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {t1}"},
         timeout=3,
@@ -508,7 +561,7 @@ def test_internal_admin_expired_jwt_blocked():
     t2 = _good_token(scopes=("metrics:read",))
     time.sleep(7)  # > TOKEN_TTL_SECONDS=5 plus PyJWT leeway=2
 
-    r2 = requests.get(
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {t2}"},
         timeout=3,
@@ -523,7 +576,7 @@ def test_internal_admin_relies_on_jwks_pubkey_only():
     (fetched from JWKS). It cannot itself sign anything. We assert this
     by checking that the JWKS endpoint returns Ed25519 public material
     and that no private material is exposed by token-service."""
-    r = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
+    r = _S.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
     body = json.dumps(r.json())
     # Trivially, there should be no "d" (Ed25519 private scalar) in JWK
     # output. This would be a critical regression.
@@ -579,6 +632,20 @@ def test_compromised_gateway_cannot_mint_admin_export():
     assert "admin:export" in r.json()["error"]
 
 
+def test_compromised_gateway_cannot_mint_debug_read():
+    """Additional blast-radius reduction in this turn. gateway's
+    policy was further reduced to metrics:read ONLY, so debug:read
+    (feature flags, env label) is also out of reach."""
+    r = _mint(
+        audience="internal-admin",
+        scopes=["debug:read"],
+        client_id=GATEWAY_CLIENT_ID,
+        client_secret=GATEWAY_CLIENT_SECRET,
+    )
+    assert r.status_code == 403
+    assert "debug:read" in r.json()["error"]
+
+
 def test_compromised_gateway_cannot_mint_admin_export_mixed_with_metrics():
     """Scope-subset attack: try to get admin:export by bundling it
     with an allowed scope. Token-service must refuse the whole
@@ -630,13 +697,13 @@ def test_compromised_gateway_cannot_mint_for_nonexistent_audience():
 def test_compromised_gateway_cannot_use_old_legacy_paths():
     """A compromised gateway with knowledge of the legacy secrets must
     no longer get anywhere. The old shared secrets are dead."""
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"X-Internal-Key": "super-secret-internal-key"},
         timeout=3,
     )
     assert r.status_code == 401
-    r2 = requests.get(
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"X-Export-Token": "ring-export-token"},
         timeout=3,
@@ -657,13 +724,13 @@ def test_compromised_gateway_cannot_replay_other_service_token():
     )
     assert r.status_code == 200, r.text
     token = r.json()["token"]
-    r1 = requests.get(
+    r1 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
     )
     assert r1.status_code == 200
-    r2 = requests.get(
+    r2 = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
         timeout=3,
@@ -695,7 +762,7 @@ def test_internal_admin_rejects_alg_none():
     h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
     p = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
     forged = f"{h}.{p}."
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {forged}"},
         timeout=3,
@@ -715,7 +782,7 @@ def test_internal_admin_rejects_tampered_payload():
         base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
     )
     tampered = f"{parts[0]}.{new_payload_b64}.{parts[2]}"
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",
         headers={"Authorization": f"Bearer {tampered}"},
         timeout=3,
@@ -733,7 +800,7 @@ def test_internal_admin_rejects_tampered_aud():
         base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
     )
     tampered = f"{parts[0]}.{new_payload_b64}.{parts[2]}"
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {tampered}"},
         timeout=3,
@@ -747,7 +814,7 @@ def test_mint_v2_audience_must_be_string_not_list():
     ts = str(int(time.time()))
     nonce = secrets.token_urlsafe(24)
     sig = _sign_client_request(GATEWAY_CLIENT_ID, GATEWAY_CLIENT_SECRET, ts, nonce)
-    r = requests.post(
+    r = _S.post(
         f"{TOKEN_SERVICE_BASE}/v2/mint",
         json={
             "audience": ["internal-admin", "other-service"],
@@ -769,7 +836,7 @@ def test_mint_v2_scopes_with_non_string_blocked():
     ts = str(int(time.time()))
     nonce = secrets.token_urlsafe(24)
     sig = _sign_client_request(GATEWAY_CLIENT_ID, GATEWAY_CLIENT_SECRET, ts, nonce)
-    r = requests.post(
+    r = _S.post(
         f"{TOKEN_SERVICE_BASE}/v2/mint",
         json={
             "audience": "internal-admin",
@@ -790,7 +857,7 @@ def test_mint_v2_zero_scopes_blocked():
     ts = str(int(time.time()))
     nonce = secrets.token_urlsafe(24)
     sig = _sign_client_request(GATEWAY_CLIENT_ID, GATEWAY_CLIENT_SECRET, ts, nonce)
-    r = requests.post(
+    r = _S.post(
         f"{TOKEN_SERVICE_BASE}/v2/mint",
         json={"audience": "internal-admin", "scopes": []},
         headers={
@@ -839,7 +906,7 @@ def test_mint_v2_nonce_reuse_with_different_timestamp_blocked():
 def _lab_reset_token_service():
     """Lab-only: reset the rate-limiter and nonce cache on token-service
     so that rate-limit tests start from a deterministic state."""
-    r = requests.post(
+    r = _S.post(
         f"{TOKEN_SERVICE_BASE}/_test/reset",
         headers={"X-Test-Reset-Token": "dojo-test-reset"},
         timeout=3,
@@ -914,9 +981,9 @@ def test_mint_rate_limit_does_not_affect_other_clients():
 def test_mint_reset_endpoint_requires_token():
     """The lab reset endpoint must refuse callers who don't present
     the header secret."""
-    r1 = requests.post(f"{TOKEN_SERVICE_BASE}/_test/reset", timeout=3)
+    r1 = _S.post(f"{TOKEN_SERVICE_BASE}/_test/reset", timeout=3)
     assert r1.status_code == 403
-    r2 = requests.post(
+    r2 = _S.post(
         f"{TOKEN_SERVICE_BASE}/_test/reset",
         headers={"X-Test-Reset-Token": "wrong"},
         timeout=3,
@@ -932,7 +999,7 @@ def test_mint_rate_limit_does_not_block_unknown_clients_consuming_budget():
     _lab_reset_token_service()
     # Send 20 requests as a made-up ghost-client
     for _ in range(20):
-        r = requests.post(
+        r = _S.post(
             f"{TOKEN_SERVICE_BASE}/v2/mint",
             json={"audience": "internal-admin", "scopes": ["metrics:read"]},
             headers={
@@ -959,7 +1026,7 @@ def test_jwks_pin_fingerprint_matches_live_key():
     fixed Ed25519 public key. Fetch the live JWKS and confirm the
     pinned value matches. If this test fails, the pin is wrong and
     internal-admin will refuse all tokens."""
-    r = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
+    r = _S.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
     x_b64 = r.json()["keys"][0]["x"]
     raw = base64.urlsafe_b64decode(x_b64 + "=" * (-len(x_b64) % 4))
     actual = hashlib.sha256(raw).hexdigest()
@@ -1069,12 +1136,115 @@ def test_jwks_fingerprint_rejects_substituted_key_in_process():
         srv.shutdown()
 
 
+# ===========================================================================
+# 9. mTLS transport layer
+# ===========================================================================
+
+
+def test_token_service_rejects_connection_without_client_cert():
+    """A TCP connection to token-service without a valid client cert
+    must fail at the TLS handshake, not return a 401 from the app."""
+    bare = requests.Session()
+    bare.verify = CA_FILE  # trust server cert but send no client cert
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        bare.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3)
+
+
+def test_internal_admin_rejects_connection_without_client_cert():
+    bare = requests.Session()
+    bare.verify = CA_FILE
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        bare.get(f"{INTERNAL_ADMIN_BASE}/health", timeout=3)
+
+
+def test_internal_admin_rejects_self_signed_rogue_client_cert():
+    """A client cert not chained to the lab CA must be rejected at
+    the TLS handshake."""
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+    rogue_key = _ec.generate_private_key(_ec.SECP256R1())
+    now = datetime.now(timezone.utc)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rogue-attacker")])
+    rogue_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(rogue_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=True,
+        )
+        .sign(rogue_key, hashes.SHA256())
+    )
+    with (
+        tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False) as cf,
+        tempfile.NamedTemporaryFile("wb", suffix=".key", delete=False) as kf,
+    ):
+        cf.write(rogue_cert.public_bytes(serialization.Encoding.PEM))
+        kf.write(
+            rogue_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+        cert_path, key_path = cf.name, kf.name
+
+    rogue_session = requests.Session()
+    rogue_session.cert = (cert_path, key_path)
+    rogue_session.verify = CA_FILE
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        rogue_session.get(f"{INTERNAL_ADMIN_BASE}/health", timeout=3)
+
+
+def test_internal_admin_refuses_untrusted_server_cert():
+    """If a caller doesn't trust the lab CA, the peer's server cert
+    fails verification. This is the protection against a rogue
+    'internal-admin' impersonator."""
+    import tempfile
+
+    # Empty CA bundle -> no issuer is trusted
+    with tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as f:
+        f.write(b"# empty CA bundle\n")
+        empty_ca = f.name
+    s = requests.Session()
+    s.cert = _CLIENT_CERT_TUPLE
+    s.verify = empty_ca
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        s.get(f"{INTERNAL_ADMIN_BASE}/health", timeout=3)
+
+
+def test_gateway_external_port_remains_plain_http():
+    """By design, gateway's external surface is HTTP so existing
+    smoke scripts and user CLIs continue to work without needing the
+    lab CA. mTLS is only enforced on the internal mesh."""
+    r = requests.get(f"{GATEWAY_BASE}/health", timeout=3)
+    assert r.status_code == 200
+    assert r.json()["service"] == "gateway"
+
+
 def test_internal_admin_rejects_alg_hs256_with_pubkey_as_secret():
     """The classic 'sign with HS256 using the public key as secret'
     attack. The verifier's algorithms list pins to EdDSA only, so this
     must fail."""
     # Get the JWKS
-    jwks = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3).json()
+    jwks = _S.get(f"{TOKEN_SERVICE_BASE}/.well-known/jwks.json", timeout=3).json()
     pub_key_x = jwks["keys"][0]["x"]
     # Use the raw key bytes as an HMAC secret
     raw = base64.urlsafe_b64decode(pub_key_x + "=" * (-len(pub_key_x) % 4))
@@ -1093,7 +1263,7 @@ def test_internal_admin_rejects_alg_hs256_with_pubkey_as_secret():
         raw,
         algorithm="HS256",
     )
-    r = requests.get(
+    r = _S.get(
         f"{INTERNAL_ADMIN_BASE}/internal/metrics",
         headers={"Authorization": f"Bearer {forged}"},
         timeout=3,

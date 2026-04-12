@@ -7,16 +7,23 @@ services:
     environment:
       APP_ENV: dev
       ALLOWED_PROXY_HOSTS: internal-admin
-      ALLOWED_PROXY_URLS: http://internal-admin:5001/health
+      # Internal calls now speak mTLS over HTTPS to the service mesh.
+      ALLOWED_PROXY_URLS: https://internal-admin:5001/health
       # Service identity: gateway is a token-service client. The secret
       # below is shared with token-service's per-client policy.
-      TOKEN_SERVICE_URL: http://token-service:5003
+      TOKEN_SERVICE_URL: https://token-service:5003
       GATEWAY_CLIENT_ID: gateway
       GATEWAY_CLIENT_SECRET: gateway-client-secret-do-not-reuse
-      INTERNAL_ADMIN_URL: http://internal-admin:5001
+      INTERNAL_ADMIN_URL: https://internal-admin:5001
       # User-level admin auth on /admin/* endpoints. Distinct from the
       # service-identity layer; rotate independently in a real deploy.
       ADMIN_API_KEY: lab-admin-key-rotate-me
+      # mTLS material
+      INTERNAL_CA_FILE: /certs/ca.crt
+      INTERNAL_CLIENT_CERT: /certs/gateway.crt
+      INTERNAL_CLIENT_KEY: /certs/gateway.key
+    volumes:
+      - ./certs:/certs:ro
     depends_on:
       - internal-admin
       - redirector
@@ -31,15 +38,21 @@ services:
       APP_ENV: dev
       EXPECTED_ISSUER: token-service
       EXPECTED_AUDIENCE: internal-admin
-      JWKS_URL: http://token-service:5003/.well-known/jwks.json
+      JWKS_URL: https://token-service:5003/.well-known/jwks.json
       JWKS_CACHE_TTL_SECONDS: 300
       JTI_CACHE_TTL_SECONDS: 300
-      # Fingerprint pinning. If any future JWKS fetch returns a key
-      # whose raw bytes do not hash to this value, the response is
-      # rejected. Defends against JWKS-MitM on a hostile docker bridge
-      # where an attacker with CAP_NET_RAW could ARP-spoof token-service.
+      # Fingerprint pinning. Second line of defense in addition to
+      # mTLS chain verification of token-service.
       EXPECTED_JWKS_KEY_SHA256: 9dd6f1aade2123e61705f2db001903284666e81d6331a58c86936f89659ba419
       JWKS_REFRESH_MIN_INTERVAL_SECONDS: 10
+      # mTLS material
+      SERVER_CERT_FILE: /certs/internal-admin.crt
+      SERVER_KEY_FILE: /certs/internal-admin.key
+      INTERNAL_CA_FILE: /certs/ca.crt
+      INTERNAL_CLIENT_CERT: /certs/internal-admin.crt
+      INTERNAL_CLIENT_KEY: /certs/internal-admin.key
+    volumes:
+      - ./certs:/certs:ro
     depends_on:
       - token-service
     expose:
@@ -50,6 +63,9 @@ services:
   redirector:
     build: ./redirector
     container_name: redirector
+    # Deliberately plain HTTP: redirector is the SSRF test fixture
+    # that exists so /fetch validation can refuse internal targets.
+    # Wrapping it in TLS would hide the security control being tested.
     expose:
       - "5002"
     networks:
@@ -65,20 +81,22 @@ services:
       # how chatty mint is.
       TOKEN_TTL_SECONDS: 5
       TIMESTAMP_SKEW_SECONDS: 30
-      # Per-client mint rate limit. Normal test-suite flow uses ~20
-      # mints in <1s from each client, so a burst of 30 + 1/sec refill
-      # is comfortable. A compromised gateway mint-spamming will bump
-      # into this within seconds.
+      # Per-client mint rate limit.
       MINT_RATE_LIMIT_PER_MINUTE: 60
       MINT_RATE_LIMIT_BURST: 30
       # Fixed Ed25519 signing key for the lab. NEVER reuse in
       # production - generate a fresh key per environment and store
-      # in a secret manager. Pinning the key here means the JWKS
-      # cache in internal-admin stays valid across restarts.
+      # in a secret manager.
       TOKEN_SIGNING_PRIVATE_KEY_PEM: |
         -----BEGIN PRIVATE KEY-----
         MC4CAQAwBQYDK2VwBCIEIHqmp8geK8jdwXba/u6eFqO8dieJOREYhoovrVn8bV2w
         -----END PRIVATE KEY-----
+      # mTLS material
+      SERVER_CERT_FILE: /certs/token-service.crt
+      SERVER_KEY_FILE: /certs/token-service.key
+      INTERNAL_CA_FILE: /certs/ca.crt
+    volumes:
+      - ./certs:/certs:ro
     expose:
       - "5003"
     networks:

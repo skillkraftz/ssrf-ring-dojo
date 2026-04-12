@@ -8,6 +8,7 @@ the other services on the docker bridge network by name.
 Each test name documents the bypass class it pins down.
 """
 
+import pytest
 import requests
 
 BASE = "http://127.0.0.1:5000"
@@ -202,23 +203,40 @@ def test_token_mint_requires_shared_secret():
 # ---------------------------------------------------------------------------
 # internal-admin no-auth shape tests (the legacy X-Internal-Key path is
 # gone; the only acceptable credential is now an Ed25519-signed JWT
-# minted by token-service. The full identity test suite lives in
-# test_identity.py).
+# minted by token-service, presented over mTLS. The full identity test
+# suite lives in test_identity.py).
 # ---------------------------------------------------------------------------
 
 
-_ADMIN_BASE = "http://internal-admin:5001"
+_ADMIN_BASE = "https://internal-admin:5001"
+_CA_FILE = "/certs/ca.crt"
+_CLIENT_CERT = "/certs/gateway.crt"
+_CLIENT_KEY = "/certs/gateway.key"
 
 
-def test_internal_metrics_unauthenticated_blocked():
-    r = requests.get(f"{_ADMIN_BASE}/internal/metrics", timeout=3)
+def _mtls_session():
+    s = requests.Session()
+    s.cert = (_CLIENT_CERT, _CLIENT_KEY)
+    s.verify = _CA_FILE
+    return s
+
+
+_MTLS = _mtls_session()
+
+
+def test_internal_metrics_no_bearer_blocked_at_app_layer():
+    """With a valid mTLS cert but no Bearer JWT, internal-admin must
+    still refuse. This proves the JWT layer runs even after TLS
+    succeeds -- transport is not the only gate."""
+    r = _MTLS.get(f"{_ADMIN_BASE}/internal/metrics", timeout=3)
     assert r.status_code == 401
     assert "bearer" in r.json().get("error", "").lower()
 
 
 def test_internal_metrics_legacy_x_internal_key_no_longer_accepted():
-    # The pre-identity-pivot key MUST no longer be honored.
-    r = requests.get(
+    # The pre-identity-pivot key must no longer be honored, even when
+    # presented over a valid mTLS connection.
+    r = _MTLS.get(
         f"{_ADMIN_BASE}/internal/metrics",
         headers={"X-Internal-Key": "super-secret-internal-key"},
         timeout=3,
@@ -226,9 +244,73 @@ def test_internal_metrics_legacy_x_internal_key_no_longer_accepted():
     assert r.status_code == 401
 
 
-def test_debug_config_unauthenticated_blocked():
-    r = requests.get(f"{_ADMIN_BASE}/debug/config", timeout=3)
+def test_debug_config_no_bearer_blocked_at_app_layer():
+    r = _MTLS.get(f"{_ADMIN_BASE}/debug/config", timeout=3)
     assert r.status_code == 401
+
+
+def test_internal_admin_without_client_cert_refuses_at_tls_layer():
+    """Crucial mTLS assertion: a connection that does NOT present a
+    valid lab-CA-signed client cert must fail at the TLS handshake,
+    not return a 401 from the app. This proves the transport layer
+    is actively enforcing mTLS, not just the JWT layer."""
+    import ssl
+
+    bare = requests.Session()
+    bare.verify = _CA_FILE  # trust the server's cert but send no client cert
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        bare.get(f"{_ADMIN_BASE}/internal/metrics", timeout=3)
+
+
+def test_internal_admin_with_unknown_ca_client_cert_refused():
+    """A client cert signed by a *different* CA must be rejected."""
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    rogue_key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.now(timezone.utc)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rogue-attacker")])
+    rogue_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)  # self-signed
+        .public_key(rogue_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=True,
+        )
+        .sign(rogue_key, hashes.SHA256())
+    )
+    with (
+        tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False) as cf,
+        tempfile.NamedTemporaryFile("wb", suffix=".key", delete=False) as kf,
+    ):
+        cf.write(rogue_cert.public_bytes(serialization.Encoding.PEM))
+        kf.write(
+            rogue_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+        cf_name, kf_name = cf.name, kf.name
+
+    rogue_session = requests.Session()
+    rogue_session.cert = (cf_name, kf_name)
+    rogue_session.verify = _CA_FILE
+    with pytest.raises(
+        (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+    ):
+        rogue_session.get(f"{_ADMIN_BASE}/internal/metrics", timeout=3)
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +512,8 @@ def test_admin_export_query_token_directly_refused():
     """Even bypassing the gateway entirely, internal-admin must refuse a
     request that supplies a token via query string. The legacy bearer
     path is gone, so the only acceptable credential is a JWT in the
-    Authorization header."""
-    r = requests.get(
+    Authorization header presented over mTLS."""
+    r = _MTLS.get(
         f"{_ADMIN_BASE}/admin/export?access_token=ring-export-token",
         timeout=3,
     )
@@ -441,9 +523,10 @@ def test_admin_export_query_token_directly_refused():
 def test_legacy_token_service_mint_endpoint_is_gone():
     """The legacy /mint endpoint accepted any caller claiming a service
     identity. It must no longer exist; only /v2/mint with HMAC-signed
-    client credentials remains."""
-    r = requests.get(
-        "http://token-service:5003/mint",
+    client credentials remains. The probe uses mTLS because all
+    token-service endpoints are now HTTPS."""
+    r = _MTLS.get(
+        "https://token-service:5003/mint",
         params={"aud": "internal-admin-export", "service": "internal-admin"},
         timeout=3,
     )

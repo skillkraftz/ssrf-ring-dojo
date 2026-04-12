@@ -59,9 +59,13 @@ log = app.logger
 
 EXPECTED_ISSUER = os.getenv("EXPECTED_ISSUER", "token-service")
 EXPECTED_AUDIENCE = os.getenv("EXPECTED_AUDIENCE", "internal-admin")
-JWKS_URL = os.getenv("JWKS_URL", "http://token-service:5003/.well-known/jwks.json")
+JWKS_URL = os.getenv("JWKS_URL", "https://token-service:5003/.well-known/jwks.json")
 JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "300"))
 JTI_CACHE_TTL_SECONDS = int(os.getenv("JTI_CACHE_TTL_SECONDS", "300"))
+# mTLS material for outbound JWKS fetch
+INTERNAL_CA_FILE = os.getenv("INTERNAL_CA_FILE", "/certs/ca.crt")
+INTERNAL_CLIENT_CERT = os.getenv("INTERNAL_CLIENT_CERT", "/certs/internal-admin.crt")
+INTERNAL_CLIENT_KEY = os.getenv("INTERNAL_CLIENT_KEY", "/certs/internal-admin.key")
 # Optional: pin the expected SHA-256 of the Ed25519 public key bytes.
 # If set, any JWKS response whose key does not hash to this value is
 # rejected, even if the response is otherwise well-formed. This closes
@@ -133,8 +137,18 @@ class _JWKSCache:
 
     def _fetch_locked(self) -> bytes:
         """Fetch the JWKS. Caller must hold self._lock. Raises on
-        parse failure or fingerprint mismatch."""
-        resp = requests.get(self._url, timeout=3)
+        parse failure or fingerprint mismatch.
+
+        The fetch uses mTLS: we present our own client cert so
+        token-service accepts the request, and we verify
+        token-service's cert chains to the lab CA.
+        """
+        resp = requests.get(
+            self._url,
+            timeout=3,
+            cert=(INTERNAL_CLIENT_CERT, INTERNAL_CLIENT_KEY),
+            verify=INTERNAL_CA_FILE,
+        )
         resp.raise_for_status()
         data = resp.json()
         for k in data.get("keys", []):
@@ -349,5 +363,27 @@ def admin_export():
     )
 
 
+# ---------------------------------------------------------------------------
+# mTLS server bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _build_mtls_context():
+    """Build a server-side SSLContext that requires a lab-CA-signed
+    client cert for every connection. See token-service for rationale."""
+    import ssl as _ssl
+
+    server_cert = os.getenv("SERVER_CERT_FILE", "/certs/internal-admin.crt")
+    server_key = os.getenv("SERVER_KEY_FILE", "/certs/internal-admin.key")
+    ca_file = INTERNAL_CA_FILE
+
+    ctx = _ssl.create_default_context(_ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(certfile=server_cert, keyfile=server_key)
+    ctx.load_verify_locations(cafile=ca_file)
+    ctx.verify_mode = _ssl.CERT_REQUIRED
+    ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+    app.run(host="0.0.0.0", port=5001, ssl_context=_build_mtls_context())

@@ -94,8 +94,9 @@ RATE_LIMIT_BURST = int(os.getenv("FETCH_RATE_LIMIT_BURST", "60"))
 # per-service shared secret used to HMAC-sign mint requests. It does NOT
 # hold token-service's signing key, so a compromise of the gateway can
 # only mint tokens within the policy that token-service grants to this
-# client_id, and cannot forge tokens for any other identity.
-TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "http://token-service:5003")
+# client_id (currently only metrics:read), and cannot forge tokens for
+# any other identity.
+TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "https://token-service:5003")
 GATEWAY_CLIENT_ID = os.getenv("GATEWAY_CLIENT_ID", "gateway")
 GATEWAY_CLIENT_SECRET = os.getenv(
     "GATEWAY_CLIENT_SECRET", "gateway-client-secret-do-not-reuse"
@@ -106,7 +107,29 @@ GATEWAY_CLIENT_SECRET = os.getenv(
 # the gateway's external surface must present this key to invoke an
 # admin action, on top of the gateway then minting a service token.
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "lab-admin-key-rotate-me")
-INTERNAL_ADMIN_URL = os.getenv("INTERNAL_ADMIN_URL", "http://internal-admin:5001")
+INTERNAL_ADMIN_URL = os.getenv("INTERNAL_ADMIN_URL", "https://internal-admin:5001")
+
+# mTLS material for gateway -> internal mesh calls. Gateway presents
+# its own cert + key and verifies peers against the lab CA.
+INTERNAL_CA_FILE = os.getenv("INTERNAL_CA_FILE", "/certs/ca.crt")
+INTERNAL_CLIENT_CERT = os.getenv("INTERNAL_CLIENT_CERT", "/certs/gateway.crt")
+INTERNAL_CLIENT_KEY = os.getenv("INTERNAL_CLIENT_KEY", "/certs/gateway.key")
+
+
+def _internal_session() -> requests.Session:
+    """Returns a requests.Session preconfigured with the gateway's
+    client cert and the lab CA bundle. Every inter-service call MUST
+    go through this session so that mTLS is the default posture, not
+    an opt-in."""
+    s = requests.Session()
+    s.cert = (INTERNAL_CLIENT_CERT, INTERNAL_CLIENT_KEY)
+    s.verify = INTERNAL_CA_FILE
+    return s
+
+
+# Module-level singleton so we can reuse the TLS connection pool
+# across requests.
+_INTERNAL_SESSION = _internal_session()
 
 
 class SSRFBlocked(Exception):
@@ -482,9 +505,13 @@ def fetch():
 @app.get("/proxy-health")
 def proxy_health():
     # Hardcoded code-controlled internal call. Not user-influenced.
-    target = "http://internal-admin:5001/health"
+    # Uses the mTLS-configured session so the call is authenticated
+    # at the transport layer too.
+    target = f"{INTERNAL_ADMIN_URL}/health"
     try:
-        r = requests.get(target, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        r = _INTERNAL_SESSION.get(
+            target, timeout=REQUEST_TIMEOUT, allow_redirects=False
+        )
         return jsonify({"upstream_status": r.status_code, "body": r.json()})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -501,7 +528,9 @@ def proxy_allowlisted():
         return jsonify({"error": "host not allowlisted"}), 403
 
     try:
-        r = requests.get(target, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        r = _INTERNAL_SESSION.get(
+            target, timeout=REQUEST_TIMEOUT, allow_redirects=False
+        )
         return jsonify({"upstream_status": r.status_code, "body": r.json()})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -539,7 +568,7 @@ def _mint_service_token(audience: str, scopes: list[str]) -> dict:
     }
     body = {"audience": audience, "scopes": scopes}
     try:
-        r = requests.post(
+        r = _INTERNAL_SESSION.post(
             f"{TOKEN_SERVICE_URL}/v2/mint",
             json=body,
             headers=headers,
@@ -576,7 +605,7 @@ def _call_internal_admin(path: str, scope: str) -> tuple:
         return 502, {"error": f"identity: {exc}"}
     token = mint["token"]
     try:
-        r = requests.get(
+        r = _INTERNAL_SESSION.get(
             f"{INTERNAL_ADMIN_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
             timeout=REQUEST_TIMEOUT,
@@ -640,11 +669,24 @@ def _test_reset():
 
 @app.get("/admin/debug-config")
 def admin_debug_config():
-    if not _check_admin_api_key():
-        return jsonify({"error": "unauthorized"}), 401
-    status, body = _call_internal_admin("/debug/config", "debug:read")
-    return jsonify({"upstream_status": status, "body": body}), (
-        200 if status == 200 else 502
+    # Intentionally retired in the same style as /admin/export.
+    # Gateway's token-service client policy no longer holds
+    # debug:read, so the only way to reach /debug/config is from a
+    # dedicated debug-client identity whose credentials are not
+    # present in the gateway container. Returning 410 Gone so an
+    # operator gets a clear signal rather than a 401/403.
+    return (
+        jsonify(
+            {
+                "error": "gone",
+                "detail": (
+                    "debug:read is no longer granted to the gateway. "
+                    "Run the debug flow from the dedicated debug-client "
+                    "credentials that are not present in the gateway."
+                ),
+            }
+        ),
+        410,
     )
 
 

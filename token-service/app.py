@@ -105,32 +105,36 @@ def _load_clients() -> dict:
     if not data:
         # Lab defaults. NEVER reuse these in production.
         #
-        # Policy split: the gateway runs the public-facing surface and
-        # is the most likely container to be compromised. It is therefore
-        # granted ONLY the scopes it needs for its legitimate operator
-        # dashboards (metrics and debug). The admin:export scope, which
-        # reads customer PII, lives on a separate client identity
-        # (export-job) whose credentials are deliberately NOT stored in
-        # the gateway container. A compromise of gateway therefore
-        # cannot exfiltrate via /admin/export.
+        # Minimum privilege: gateway's policy is locked to ONLY
+        # metrics:read. Previously it also held debug:read and (before
+        # turn 4) admin:export, both of which have been moved to
+        # dedicated client identities whose credentials are NOT present
+        # in the gateway container. A compromise of gateway therefore
+        # cannot mint anything except a metrics:read token -- the
+        # smallest useful blast radius for a public-facing service.
         data = {
             "gateway": {
                 "secret": "gateway-client-secret-do-not-reuse",
                 "allowed_audiences": ["internal-admin"],
-                "allowed_scopes": ["metrics:read", "debug:read"],
+                "allowed_scopes": ["metrics:read"],
             },
             "export-job": {
-                # This client represents a separate process (batch job,
-                # dedicated worker, admin CLI, etc.) that owns the
-                # sensitive export flow. Its secret is NOT present in
-                # gateway's environment.
+                # Dedicated identity for the sensitive export flow.
                 "secret": "export-job-secret-do-not-reuse",
                 "allowed_audiences": ["internal-admin"],
                 "allowed_scopes": ["admin:export"],
             },
+            "debug-client": {
+                # Dedicated identity for /debug/config. In production
+                # this would be a separate admin CLI or ops tool whose
+                # credentials never touch the gateway.
+                "secret": "debug-client-secret-do-not-reuse",
+                "allowed_audiences": ["internal-admin"],
+                "allowed_scopes": ["debug:read"],
+            },
             "metrics-only-client": {
-                # Demonstrates per-client scope restriction. Has valid
-                # credentials but is policy-limited to metrics:read.
+                # Regression-test identity. Has valid credentials but
+                # is policy-limited to metrics:read.
                 "secret": "metrics-only-secret-do-not-reuse",
                 "allowed_audiences": ["internal-admin"],
                 "allowed_scopes": ["metrics:read"],
@@ -451,5 +455,35 @@ def mint_v2():
     )
 
 
+# ---------------------------------------------------------------------------
+# mTLS server bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _build_mtls_context() -> "ssl.SSLContext":
+    """Build a server-side SSLContext that:
+      * presents token-service's own cert + key
+      * requires every connecting peer to present a client cert
+      * verifies the client cert chains to the lab CA
+
+    This enforces mutual TLS at the transport layer for every endpoint
+    served by token-service. There are no plaintext listeners at all.
+    """
+    import ssl as _ssl
+
+    server_cert = os.getenv("SERVER_CERT_FILE", "/certs/token-service.crt")
+    server_key = os.getenv("SERVER_KEY_FILE", "/certs/token-service.key")
+    ca_file = os.getenv("INTERNAL_CA_FILE", "/certs/ca.crt")
+
+    ctx = _ssl.create_default_context(_ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(certfile=server_cert, keyfile=server_key)
+    ctx.load_verify_locations(cafile=ca_file)
+    ctx.verify_mode = _ssl.CERT_REQUIRED
+    ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5003)
+    import ssl
+
+    app.run(host="0.0.0.0", port=5003, ssl_context=_build_mtls_context())

@@ -18,9 +18,10 @@ def test_proxy_health_still_works():
 
 
 def test_allowlisted_proxy_health_still_works():
+    # Internal mesh is mTLS-only now, so the allowlisted URL is https://.
     r = requests.get(
         f"{BASE}/proxy-allowlisted",
-        params={"target": "http://internal-admin:5001/health"},
+        params={"target": "https://internal-admin:5001/health"},
         timeout=3,
     )
     assert r.status_code == 200
