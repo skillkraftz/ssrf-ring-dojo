@@ -200,60 +200,35 @@ def test_token_mint_requires_shared_secret():
 
 
 # ---------------------------------------------------------------------------
-# Defense-in-depth: internal-admin auth on metrics/debug endpoints
-#
-# These tests issue requests *directly* to internal-admin from inside the
-# gateway container (the gateway can resolve and reach it on the docker
-# bridge network) rather than via /fetch. They prove the receiving service
-# requires authentication regardless of who is calling it.
+# internal-admin no-auth shape tests (the legacy X-Internal-Key path is
+# gone; the only acceptable credential is now an Ed25519-signed JWT
+# minted by token-service. The full identity test suite lives in
+# test_identity.py).
 # ---------------------------------------------------------------------------
 
 
 _ADMIN_BASE = "http://internal-admin:5001"
-_INTERNAL_KEY = "super-secret-internal-key"
 
 
 def test_internal_metrics_unauthenticated_blocked():
     r = requests.get(f"{_ADMIN_BASE}/internal/metrics", timeout=3)
-    assert r.status_code == 403
-    assert r.json().get("error") == "forbidden"
+    assert r.status_code == 401
+    assert "bearer" in r.json().get("error", "").lower()
 
 
-def test_internal_metrics_with_correct_key_works():
+def test_internal_metrics_legacy_x_internal_key_no_longer_accepted():
+    # The pre-identity-pivot key MUST no longer be honored.
     r = requests.get(
         f"{_ADMIN_BASE}/internal/metrics",
-        headers={"X-Internal-Key": _INTERNAL_KEY},
+        headers={"X-Internal-Key": "super-secret-internal-key"},
         timeout=3,
     )
-    assert r.status_code == 200
-    payload = r.json()
-    assert payload["service"] == "internal-admin"
-    assert payload["status"] == "ok"
-
-
-def test_internal_metrics_with_wrong_key_blocked():
-    r = requests.get(
-        f"{_ADMIN_BASE}/internal/metrics",
-        headers={"X-Internal-Key": "definitely-not-the-key"},
-        timeout=3,
-    )
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
 def test_debug_config_unauthenticated_blocked():
     r = requests.get(f"{_ADMIN_BASE}/debug/config", timeout=3)
-    # APP_ENV is "dev" in the lab, so missing auth gets a 403, not a 404.
-    assert r.status_code == 403
-
-
-def test_debug_config_with_key_works_in_dev():
-    r = requests.get(
-        f"{_ADMIN_BASE}/debug/config",
-        headers={"X-Internal-Key": _INTERNAL_KEY},
-        timeout=3,
-    )
-    assert r.status_code == 200
-    assert r.json()["service"] == "internal-admin"
+    assert r.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -451,59 +426,28 @@ def test_dns_rebinding_any_internal_record_blocked():
         socket.getaddrinfo = real_getaddrinfo
 
 
-def test_internal_admin_key_compare_is_constant_time_for_close_values():
-    """Smoke test that the close-but-wrong key cases all return 403,
-    independent of how much of the key matches the start. We don't
-    measure timing in CI (too noisy), but we *do* assert that none of
-    the near-matches succeed. compare_digest plus header-only auth
-    means a one-character difference is treated identically to a
-    completely wrong key."""
-    key = _INTERNAL_KEY
-    cases = [
-        key + "X",
-        "X" + key,
-        key[:-1],
-        key.replace("-", "_"),
-        key.upper(),
-        "",
-    ]
-    for bad in cases:
-        r = requests.get(
-            f"{_ADMIN_BASE}/internal/metrics",
-            headers={"X-Internal-Key": bad},
-            timeout=3,
-        )
-        assert r.status_code == 403, f"unexpected accept of {bad!r} -> {r.status_code}"
-
-
 def test_admin_export_query_token_directly_refused():
-    """Even bypassing the gateway entirely, internal-admin must refuse
-    a request that supplies the token via query string instead of the
-    X-Export-Token header (defense in depth on the receiving side)."""
+    """Even bypassing the gateway entirely, internal-admin must refuse a
+    request that supplies a token via query string. The legacy bearer
+    path is gone, so the only acceptable credential is a JWT in the
+    Authorization header."""
     r = requests.get(
         f"{_ADMIN_BASE}/admin/export?access_token=ring-export-token",
         timeout=3,
     )
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
-def test_token_service_mint_directly_requires_secret():
-    """Direct call to token-service /mint must require the shared
-    secret, regardless of the claimed service name."""
+def test_legacy_token_service_mint_endpoint_is_gone():
+    """The legacy /mint endpoint accepted any caller claiming a service
+    identity. It must no longer exist; only /v2/mint with HMAC-signed
+    client credentials remains."""
     r = requests.get(
         "http://token-service:5003/mint",
         params={"aud": "internal-admin-export", "service": "internal-admin"},
         timeout=3,
     )
-    assert r.status_code == 403
-    r2 = requests.get(
-        "http://token-service:5003/mint",
-        params={"aud": "internal-admin-export", "service": "internal-admin"},
-        headers={"X-Service-Secret": "dojo-shared-secret"},
-        timeout=3,
-    )
-    assert r2.status_code == 200
-    assert r2.json()["access_token"]
+    assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------

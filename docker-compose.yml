@@ -8,6 +8,15 @@ services:
       APP_ENV: dev
       ALLOWED_PROXY_HOSTS: internal-admin
       ALLOWED_PROXY_URLS: http://internal-admin:5001/health
+      # Service identity: gateway is a token-service client. The secret
+      # below is shared with token-service's per-client policy.
+      TOKEN_SERVICE_URL: http://token-service:5003
+      GATEWAY_CLIENT_ID: gateway
+      GATEWAY_CLIENT_SECRET: gateway-client-secret-do-not-reuse
+      INTERNAL_ADMIN_URL: http://internal-admin:5001
+      # User-level admin auth on /admin/* endpoints. Distinct from the
+      # service-identity layer; rotate independently in a real deploy.
+      ADMIN_API_KEY: lab-admin-key-rotate-me
     depends_on:
       - internal-admin
       - redirector
@@ -20,9 +29,13 @@ services:
     container_name: internal-admin
     environment:
       APP_ENV: dev
-      INTERNAL_API_KEY: super-secret-internal-key
-      EXPORT_TOKEN: ring-export-token
-      MINT_AUDIENCE: internal-admin-export
+      EXPECTED_ISSUER: token-service
+      EXPECTED_AUDIENCE: internal-admin
+      JWKS_URL: http://token-service:5003/.well-known/jwks.json
+      JWKS_CACHE_TTL_SECONDS: 300
+      JTI_CACHE_TTL_SECONDS: 300
+    depends_on:
+      - token-service
     expose:
       - "5001"
     networks:
@@ -41,8 +54,19 @@ services:
     container_name: token-service
     environment:
       APP_ENV: dev
-      TOKEN_AUDIENCE: internal-admin-export
-      SERVICE_SHARED_SECRET: dojo-shared-secret
+      # Lab-tightened TTL so the expiration regression test does not
+      # need a long sleep. Production should use 60-300s depending on
+      # how chatty mint is.
+      TOKEN_TTL_SECONDS: 5
+      TIMESTAMP_SKEW_SECONDS: 30
+      # Fixed Ed25519 signing key for the lab. NEVER reuse in
+      # production - generate a fresh key per environment and store
+      # in a secret manager. Pinning the key here means the JWKS
+      # cache in internal-admin stays valid across restarts.
+      TOKEN_SIGNING_PRIVATE_KEY_PEM: |
+        -----BEGIN PRIVATE KEY-----
+        MC4CAQAwBQYDK2VwBCIEIHqmp8geK8jdwXba/u6eFqO8dieJOREYhoovrVn8bV2w
+        -----END PRIVATE KEY-----
     expose:
       - "5003"
     networks:

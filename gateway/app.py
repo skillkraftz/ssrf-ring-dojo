@@ -39,9 +39,12 @@ is gated by an exact-string allowlist.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
+import secrets
 import socket
 import ssl
 import time
@@ -86,6 +89,24 @@ ALLOWED_SCHEMES = ("http", "https")
 # >2 req/s sustained will quickly run out of tokens.
 RATE_LIMIT_PER_MINUTE = int(os.getenv("FETCH_RATE_LIMIT_PER_MINUTE", "120"))
 RATE_LIMIT_BURST = int(os.getenv("FETCH_RATE_LIMIT_BURST", "60"))
+
+# Service identity. The gateway is a CLIENT of token-service: it holds a
+# per-service shared secret used to HMAC-sign mint requests. It does NOT
+# hold token-service's signing key, so a compromise of the gateway can
+# only mint tokens within the policy that token-service grants to this
+# client_id, and cannot forge tokens for any other identity.
+TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "http://token-service:5003")
+GATEWAY_CLIENT_ID = os.getenv("GATEWAY_CLIENT_ID", "gateway")
+GATEWAY_CLIENT_SECRET = os.getenv(
+    "GATEWAY_CLIENT_SECRET", "gateway-client-secret-do-not-reuse"
+)
+
+# User-level admin auth on the gateway's /admin/* endpoints. This is
+# distinct from the service-identity layer: even an attacker reaching
+# the gateway's external surface must present this key to invoke an
+# admin action, on top of the gateway then minting a service token.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "lab-admin-key-rotate-me")
+INTERNAL_ADMIN_URL = os.getenv("INTERNAL_ADMIN_URL", "http://internal-admin:5001")
 
 
 class SSRFBlocked(Exception):
@@ -484,6 +505,119 @@ def proxy_allowlisted():
         return jsonify({"upstream_status": r.status_code, "body": r.json()})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+# ---------------------------------------------------------------------------
+# Service-identity flow: gateway as a token-service CLIENT
+# ---------------------------------------------------------------------------
+
+
+class IdentityError(Exception):
+    """Raised when the gateway fails to mint a service token."""
+
+
+def _mint_service_token(audience: str, scopes: list[str]) -> dict:
+    """Authenticate to token-service via HMAC-signed client credentials
+    and mint a short-lived JWT scoped to ``audience`` and ``scopes``.
+
+    Returns the parsed mint response. Raises IdentityError on failure.
+    Each call uses a fresh random nonce; tokens are not cached because
+    they are jti-bound to a single use at the verifier.
+    """
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    msg = f"{GATEWAY_CLIENT_ID}|{ts}|{nonce}".encode()
+    signature = hmac.new(
+        GATEWAY_CLIENT_SECRET.encode(), msg, hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "X-Client-Id": GATEWAY_CLIENT_ID,
+        "X-Client-Timestamp": ts,
+        "X-Client-Nonce": nonce,
+        "X-Client-Auth": signature,
+        "Content-Type": "application/json",
+    }
+    body = {"audience": audience, "scopes": scopes}
+    try:
+        r = requests.post(
+            f"{TOKEN_SERVICE_URL}/v2/mint",
+            json=body,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        raise IdentityError(f"token-service unreachable: {exc}") from exc
+    if r.status_code != 200:
+        raise IdentityError(f"mint failed: {r.status_code} {r.text}")
+    payload = r.json()
+    if "token" not in payload:
+        raise IdentityError("mint response missing token")
+    return payload
+
+
+def _check_admin_api_key() -> bool:
+    if not ADMIN_API_KEY:
+        # Fail closed: if no admin key is configured, no admin access.
+        return False
+    provided = request.headers.get("X-Admin-Api-Key", "")
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, ADMIN_API_KEY)
+
+
+def _call_internal_admin(path: str, scope: str) -> tuple:
+    """Mint a fresh single-use token with the requested scope and call
+    internal-admin. Returns (status_code, json_or_text)."""
+    try:
+        mint = _mint_service_token("internal-admin", [scope])
+    except IdentityError as exc:
+        log.warning("admin call denied: mint failed reason=%s", exc)
+        return 502, {"error": f"identity: {exc}"}
+    token = mint["token"]
+    try:
+        r = requests.get(
+            f"{INTERNAL_ADMIN_URL}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        return 502, {"error": str(exc)}
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, {"raw": r.text[:1024]}
+
+
+@app.get("/admin/metrics")
+def admin_metrics():
+    if not _check_admin_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    status, body = _call_internal_admin("/internal/metrics", "metrics:read")
+    return jsonify({"upstream_status": status, "body": body}), (
+        200 if status == 200 else 502
+    )
+
+
+@app.get("/admin/export")
+def admin_export():
+    if not _check_admin_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    status, body = _call_internal_admin("/admin/export", "admin:export")
+    return jsonify({"upstream_status": status, "body": body}), (
+        200 if status == 200 else 502
+    )
+
+
+@app.get("/admin/debug-config")
+def admin_debug_config():
+    if not _check_admin_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    status, body = _call_internal_admin("/debug/config", "debug:read")
+    return jsonify({"upstream_status": status, "body": body}), (
+        200 if status == 200 else 502
+    )
 
 
 if __name__ == "__main__":

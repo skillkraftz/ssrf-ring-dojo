@@ -1,37 +1,216 @@
 """
 Internal admin service.
 
-This service has no inbound exposure outside the docker bridge network.
-We still authenticate the sensitive endpoints because being on the bridge
-network is not a sufficient identity assertion: any compromised peer or
-SSRF foothold would otherwise reach them.
+Trust model
+===========
 
-Endpoint summary:
+* The docker bridge network is treated as hostile. Being on the network
+  proves NOTHING about identity.
+
+* Every protected endpoint requires an Ed25519-signed JWT minted by
+  token-service. The JWT must:
+
+    iss     == "token-service"
+    aud     == "internal-admin"
+    exp     in the future, iat not too old
+    jti     not seen before by this verifier (replay protected)
+    scope   contains the per-endpoint required scope
+    sig     verified against token-service's published public key
+
+* The verifier holds ONLY the public key, fetched from
+  token-service's JWKS endpoint with a small in-memory TTL cache.
+  internal-admin cannot mint tokens; if internal-admin is compromised,
+  the attacker cannot impersonate other services.
+
+* No more X-Internal-Key, no more X-Export-Token, no more shared
+  secrets that double as identity. The legacy header paths are gone
+  entirely.
+
+Endpoint summary
+================
 
     GET /health           - liveness, no auth (used as a probe target)
-    GET /debug/config     - dev only, requires X-Internal-Key
-    GET /internal/metrics - requires X-Internal-Key
-    GET /admin/export     - requires X-Export-Token (header only)
+    GET /debug/config     - dev only, requires Bearer JWT scope=debug:read
+    GET /internal/metrics - requires Bearer JWT scope=metrics:read
+    GET /admin/export     - requires Bearer JWT scope=admin:export
 """
 
-import hmac
-import os
+from __future__ import annotations
 
+import base64
+import logging
+import os
+import time
+from threading import Lock
+
+import jwt
+import requests
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from flask import Flask, jsonify, request
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+
 app = Flask(__name__)
+log = app.logger
 
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key")
-EXPORT_TOKEN = os.getenv("EXPORT_TOKEN", "export-me")
-MINT_AUDIENCE = os.getenv("MINT_AUDIENCE", "internal-admin-export")
+EXPECTED_ISSUER = os.getenv("EXPECTED_ISSUER", "token-service")
+EXPECTED_AUDIENCE = os.getenv("EXPECTED_AUDIENCE", "internal-admin")
+JWKS_URL = os.getenv("JWKS_URL", "http://token-service:5003/.well-known/jwks.json")
+JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "300"))
+JTI_CACHE_TTL_SECONDS = int(os.getenv("JTI_CACHE_TTL_SECONDS", "300"))
 APP_ENV = os.getenv("APP_ENV", "dev").lower()
+SIGNING_ALG = "EdDSA"
 
 
-def _check_internal_key() -> bool:
-    provided = request.headers.get("X-Internal-Key", "")
-    if not provided:
-        return False
-    return hmac.compare_digest(provided, INTERNAL_API_KEY)
+class AuthError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# JWKS cache. Lazy fetch on first verification, refresh after TTL.
+# Thread-safe. The cache invalidates itself on parse failure so a key
+# rotation can be picked up on the next call.
+# ---------------------------------------------------------------------------
+
+
+class _JWKSCache:
+    def __init__(self, url: str, ttl: int):
+        self._url = url
+        self._ttl = ttl
+        self._key_pem: bytes | None = None
+        self._fetched_at = 0.0
+        self._lock = Lock()
+
+    def get(self) -> bytes:
+        now = time.monotonic()
+        with self._lock:
+            if self._key_pem is not None and (now - self._fetched_at) < self._ttl:
+                return self._key_pem
+            self._key_pem = self._fetch()
+            self._fetched_at = now
+            return self._key_pem
+
+    def _fetch(self) -> bytes:
+        resp = requests.get(self._url, timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        for k in data.get("keys", []):
+            if (
+                k.get("kty") == "OKP"
+                and k.get("crv") == "Ed25519"
+                and k.get("alg") == SIGNING_ALG
+            ):
+                x_b64 = k["x"] + "=" * (-len(k["x"]) % 4)
+                raw = base64.urlsafe_b64decode(x_b64)
+                pub = Ed25519PublicKey.from_public_bytes(raw)
+                return pub.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+        raise RuntimeError("no Ed25519 key in JWKS response")
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._key_pem = None
+            self._fetched_at = 0.0
+
+
+JWKS_CACHE = _JWKSCache(JWKS_URL, JWKS_CACHE_TTL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection: track jtis we've seen, with TTL aligned to the
+# token's max lifetime so the cache cannot grow without bound.
+# ---------------------------------------------------------------------------
+
+
+class _JTICache:
+    def __init__(self, ttl_seconds: int):
+        self._ttl = ttl_seconds
+        self._seen: dict[str, float] = {}
+        self._lock = Lock()
+
+    def remember(self, jti: str, exp_unix: int) -> bool:
+        """Returns True if jti was new, False if it was already seen.
+        The TTL is min(exp - now, self._ttl) so memory is bounded."""
+        now = time.time()
+        with self._lock:
+            # Periodic cleanup
+            if len(self._seen) > 10000:
+                self._seen = {k: v for k, v in self._seen.items() if v > now}
+            if jti in self._seen:
+                return False
+            ttl = min(self._ttl, max(0, exp_unix - int(now)))
+            self._seen[jti] = now + ttl + 1
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seen.clear()
+
+
+JTI_CACHE = _JTICache(JTI_CACHE_TTL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# JWT verification
+# ---------------------------------------------------------------------------
+
+
+def _verify_jwt_and_scope(required_scope: str) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise AuthError("missing bearer token")
+    token = auth[7:].strip()
+    if not token:
+        raise AuthError("empty bearer token")
+
+    public_key = JWKS_CACHE.get()
+
+    try:
+        claims = jwt.decode(
+            token,
+            public_key,
+            algorithms=[SIGNING_ALG],
+            audience=EXPECTED_AUDIENCE,
+            issuer=EXPECTED_ISSUER,
+            options={
+                "require": ["exp", "iat", "iss", "aud", "jti", "sub"],
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_nbf": True,
+                "verify_aud": True,
+                "verify_iss": True,
+            },
+            leeway=2,
+        )
+    except jwt.InvalidTokenError as exc:
+        raise AuthError(f"invalid token: {exc}") from exc
+
+    # Scope check
+    scope_str = claims.get("scope", "")
+    if not isinstance(scope_str, str):
+        raise AuthError("scope must be a string")
+    token_scopes = set(scope_str.split())
+    if required_scope not in token_scopes:
+        raise AuthError(f"missing required scope: {required_scope}")
+
+    # Replay check
+    jti = claims["jti"]
+    exp = int(claims["exp"])
+    if not JTI_CACHE.remember(jti, exp):
+        raise AuthError("token already used (jti replay)")
+
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 
 @app.get("/health")
@@ -41,57 +220,45 @@ def health():
 
 @app.get("/debug/config")
 def debug_config():
-    # Defense in depth:
-    #   1. /debug/config is a development affordance and should not exist
-    #      in production. If APP_ENV is anything other than "dev" we
-    #      pretend the route does not exist (404), so an attacker who
-    #      reaches the network cannot even confirm the endpoint shape.
-    #   2. Even in dev, require the shared internal key. This avoids
-    #      "any process on the bridge network can read this".
     if APP_ENV != "dev":
         return jsonify({"error": "not found"}), 404
-    if not _check_internal_key():
-        return jsonify({"error": "forbidden"}), 403
+    try:
+        claims = _verify_jwt_and_scope("debug:read")
+    except AuthError as exc:
+        return jsonify({"error": str(exc)}), 401
     return jsonify(
         {
             "service": "internal-admin",
-            "note": "debug disabled soon",
             "env": APP_ENV,
             "feature_flags": ["metrics", "legacy_export"],
+            "caller": claims["sub"],
         }
     )
 
 
 @app.get("/internal/metrics")
 def metrics():
-    # Metrics endpoints are reasonable to keep enabled in production but
-    # must always be authenticated. The previous version was a free
-    # information disclosure to anyone on the bridge network.
-    if not _check_internal_key():
-        return jsonify({"error": "forbidden"}), 403
+    try:
+        claims = _verify_jwt_and_scope("metrics:read")
+    except AuthError as exc:
+        return jsonify({"error": str(exc)}), 401
     return jsonify(
         {
             "service": "internal-admin",
             "build": "v2.1.7",
-            "token_provider": "token-service",
-            "audience": MINT_AUDIENCE,
-            "legacy_mode": True,
+            "audience": EXPECTED_AUDIENCE,
             "status": "ok",
+            "caller": claims["sub"],
         }
     )
 
 
 @app.get("/admin/export")
 def admin_export():
-    # Tokens MUST come from a header. The legacy ?access_token= path was
-    # a credential-in-URL antipattern that allowed an SSRF chain to
-    # smuggle the token inside a fetched URL and to leak it into logs /
-    # metrics. Header-only enforcement closes that off. We use a constant
-    # time compare to avoid token-byte timing leaks.
-    header_token = request.headers.get("X-Export-Token", "")
-    if not header_token or not hmac.compare_digest(header_token, EXPORT_TOKEN):
-        return jsonify({"error": "forbidden"}), 403
-
+    try:
+        claims = _verify_jwt_and_scope("admin:export")
+    except AuthError as exc:
+        return jsonify({"error": str(exc)}), 401
     return jsonify(
         {
             "data": "sensitive export",
@@ -100,6 +267,7 @@ def admin_export():
                 {"id": 1, "email": "alice@example.internal"},
                 {"id": 2, "email": "bob@example.internal"},
             ],
+            "caller": claims["sub"],
         }
     )
 
