@@ -1,0 +1,53 @@
+services:
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    ports:
+      - "8080:5000"
+    environment:
+      APP_ENV: dev
+      ALLOWED_PROXY_HOSTS: internal-admin
+      ALLOWED_PROXY_URLS: http://internal-admin:5001/health
+    depends_on:
+      - internal-admin
+      - redirector
+      - token-service
+    networks:
+      - ring
+
+  internal-admin:
+    build: ./internal-admin
+    container_name: internal-admin
+    environment:
+      APP_ENV: dev
+      INTERNAL_API_KEY: super-secret-internal-key
+      EXPORT_TOKEN: ring-export-token
+      MINT_AUDIENCE: internal-admin-export
+    expose:
+      - "5001"
+    networks:
+      - ring
+
+  redirector:
+    build: ./redirector
+    container_name: redirector
+    expose:
+      - "5002"
+    networks:
+      - ring
+
+  token-service:
+    build: ./token-service
+    container_name: token-service
+    environment:
+      APP_ENV: dev
+      TOKEN_AUDIENCE: internal-admin-export
+      SERVICE_SHARED_SECRET: dojo-shared-secret
+    expose:
+      - "5003"
+    networks:
+      - ring
+
+networks:
+  ring:
+    driver: bridge
