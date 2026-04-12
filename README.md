@@ -22,5 +22,6 @@ docker compose up -d --build
 ## Verification
 ```bash
 docker compose exec gateway pytest -q
+docker compose exec token-service pytest -q
 ./scripts/smoke_post_patch.sh
 ```

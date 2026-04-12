@@ -1,85 +1,81 @@
-import base64
-import binascii
-import hashlib
-import hmac
-import json
 import os
-import time
 
 from flask import Flask, jsonify, request
 
+from shared.auth import AuthError, now_epoch, verify_signed_payload
+
 app = Flask(__name__)
 
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key")
-MINT_AUDIENCE = os.getenv("MINT_AUDIENCE", "internal-admin-export")
-EXPORT_SIGNING_SECRET = os.getenv("EXPORT_SIGNING_SECRET", "dev-export-signing-secret")
+SERVICE_ID = os.getenv("SERVICE_ID", "internal-admin")
+TOKEN_ISSUER = os.getenv("TOKEN_ISSUER", "token-service")
+ACCESS_TOKEN_SIGNING_SECRET = os.getenv(
+    "ACCESS_TOKEN_SIGNING_SECRET", "dev-access-token-signing-secret"
+)
+MAX_CLOCK_SKEW_SECONDS = 5
+USED_ACCESS_TOKEN_JTIS = {}
 
 
-def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
+def _prune_used_jtis(cache: dict):
+    now = now_epoch()
+    expired = [jti for jti, expires_at in cache.items() if expires_at <= now]
+    for jti in expired:
+        cache.pop(jti, None)
 
 
-def _read_export_token() -> str:
-    if request.headers.get("X-Export-Token"):
-        return request.headers["X-Export-Token"].strip()
+def _consume_access_token_jti(jti: str, expires_at: int):
+    if not jti:
+        raise AuthError("missing jti")
 
+    _prune_used_jtis(USED_ACCESS_TOKEN_JTIS)
+    if jti in USED_ACCESS_TOKEN_JTIS:
+        raise AuthError("replayed token")
+
+    USED_ACCESS_TOKEN_JTIS[jti] = expires_at
+
+
+def _read_access_token() -> str:
     auth_header = request.headers.get("Authorization", "")
     scheme, _, token = auth_header.partition(" ")
-    if scheme.lower() == "bearer" and token:
-        return token.strip()
+    if scheme.lower() != "bearer" or not token:
+        raise AuthError("missing bearer token")
+    return token.strip()
 
-    return ""
 
+def _authorize(required_scope: str):
+    payload = verify_signed_payload(_read_access_token(), ACCESS_TOKEN_SIGNING_SECRET)
+    now = now_epoch()
 
-def _verify_export_token(token: str):
-    if not token:
-        return None
-
-    try:
-        payload_b64, signature_b64 = token.split(".", 1)
-        expected_signature = (
-            base64.urlsafe_b64encode(
-                hmac.new(
-                    EXPORT_SIGNING_SECRET.encode("utf-8"),
-                    payload_b64.encode("ascii"),
-                    hashlib.sha256,
-                ).digest()
-            )
-            .rstrip(b"=")
-            .decode("ascii")
-        )
-
-        if not hmac.compare_digest(signature_b64, expected_signature):
-            return None
-
-        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
-        return None
-
-    now = int(time.time())
-    if payload.get("aud") != MINT_AUDIENCE:
-        return None
-    if not payload.get("service"):
-        return None
+    if payload.get("iss") != TOKEN_ISSUER:
+        raise AuthError("bad issuer")
+    if payload.get("aud") != SERVICE_ID:
+        raise AuthError("bad audience")
+    if payload.get("scope") != required_scope:
+        raise AuthError("insufficient scope")
+    if not payload.get("sub"):
+        raise AuthError("missing subject")
 
     try:
         expires_at = int(payload.get("exp", 0))
         issued_at = int(payload.get("iat", 0))
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise AuthError("bad timestamps") from exc
 
     if expires_at <= now:
-        return None
-    if issued_at > now + 5:
-        return None
+        raise AuthError("expired token")
+    if issued_at > now + MAX_CLOCK_SKEW_SECONDS:
+        raise AuthError("token from the future")
+
+    if payload.get("one_time") is True:
+        _consume_access_token_jti(payload.get("jti", ""), expires_at)
 
     return payload
 
 
-def _has_internal_api_key() -> bool:
-    provided = request.headers.get("X-Internal-Api-Key", "")
-    return bool(provided) and hmac.compare_digest(provided, INTERNAL_API_KEY)
+def _require_scope(required_scope: str):
+    try:
+        return _authorize(required_scope)
+    except AuthError:
+        return None
 
 
 @app.get("/health")
@@ -89,22 +85,22 @@ def health():
 
 @app.get("/debug/config")
 def debug_config():
-    if not _has_internal_api_key():
+    if _require_scope("debug.config.read") is None:
         return jsonify({"error": "forbidden"}), 403
 
     return jsonify(
         {
             "service": "internal-admin",
-            "note": "debug requires internal api key",
+            "note": "debug requires scoped bearer token",
             "env": os.getenv("APP_ENV", "dev"),
-            "feature_flags": ["metrics", "signed_export_tokens"],
+            "feature_flags": ["metrics", "scoped_service_tokens"],
         }
     )
 
 
 @app.get("/internal/metrics")
 def metrics():
-    if not _has_internal_api_key():
+    if _require_scope("internal.metrics.read") is None:
         return jsonify({"error": "forbidden"}), 403
 
     return jsonify(
@@ -112,7 +108,7 @@ def metrics():
             "service": "internal-admin",
             "build": "v2.1.7",
             "token_provider": "token-service",
-            "audience": MINT_AUDIENCE,
+            "audience": SERVICE_ID,
             "legacy_mode": False,
             "status": "ok",
         }
@@ -121,8 +117,7 @@ def metrics():
 
 @app.get("/admin/export")
 def admin_export():
-    token = _read_export_token()
-    if _verify_export_token(token) is None:
+    if _require_scope("admin.export.read") is None:
         return jsonify({"error": "forbidden"}), 403
 
     return jsonify(

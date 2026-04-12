@@ -16,13 +16,15 @@ services:
       - ring
 
   internal-admin:
-    build: ./internal-admin
+    build:
+      context: .
+      dockerfile: internal-admin/Dockerfile
     container_name: internal-admin
     environment:
       APP_ENV: dev
-      INTERNAL_API_KEY: super-secret-internal-key
-      MINT_AUDIENCE: internal-admin-export
-      EXPORT_SIGNING_SECRET: dojo-export-signing-secret
+      SERVICE_ID: internal-admin
+      TOKEN_ISSUER: token-service
+      ACCESS_TOKEN_SIGNING_SECRET: dojo-access-token-signing-secret
     expose:
       - "5001"
     networks:
@@ -37,13 +39,16 @@ services:
       - ring
 
   token-service:
-    build: ./token-service
+    build:
+      context: .
+      dockerfile: token-service/Dockerfile
     container_name: token-service
     environment:
       APP_ENV: dev
-      TOKEN_AUDIENCE: internal-admin-export
-      SERVICE_SHARED_SECRET: dojo-shared-secret
-      EXPORT_SIGNING_SECRET: dojo-export-signing-secret
+      TOKEN_ISSUER: token-service
+      ACCESS_TOKEN_SIGNING_SECRET: dojo-access-token-signing-secret
+      INTERNAL_ADMIN_CLIENT_ID: internal-admin
+      INTERNAL_ADMIN_CLIENT_SECRET: dojo-internal-admin-client-secret
     expose:
       - "5003"
     networks:

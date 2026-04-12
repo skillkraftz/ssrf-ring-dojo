@@ -41,7 +41,7 @@ def test_redirect_ssrf_to_token_mint_blocked():
 
 def test_direct_token_mint_blocked():
     r = _fetch(
-        "http://token-service:5003/mint?aud=internal-admin-export&service=internal-admin"
+        "http://token-service:5003/mint?aud=internal-admin&scope=admin.export.read"
     )
     assert r.status_code in (400, 403)
 
@@ -70,22 +70,37 @@ def test_allowlisted_proxy_cannot_be_abused_for_other_internal_url():
     assert r.status_code == 403
 
 
-def test_token_service_discovery_requires_secret_directly():
+def test_token_service_discovery_requires_assertion_directly():
     r = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/mesh", timeout=5)
     assert r.status_code == 403
 
 
-def test_token_service_mint_requires_secret_directly():
+def test_token_service_mint_requires_service_assertion_directly():
     r = requests.get(
         f"{TOKEN_SERVICE_BASE}/mint",
-        params={"aud": "internal-admin-export", "service": "internal-admin"},
+        params={"aud": "internal-admin", "scope": "admin.export.read"},
         timeout=5,
     )
     assert r.status_code == 403
 
 
-def test_internal_metrics_require_api_key_directly():
+def test_token_service_rejects_forged_service_assertion_directly():
+    r = requests.get(
+        f"{TOKEN_SERVICE_BASE}/mint",
+        params={"aud": "internal-admin", "scope": "admin.export.read"},
+        headers={"X-Service-Assertion": "bogus"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+
+
+def test_internal_metrics_require_bearer_token_directly():
     r = requests.get(f"{INTERNAL_ADMIN_BASE}/internal/metrics", timeout=5)
+    assert r.status_code == 403
+
+
+def test_debug_config_requires_bearer_token_directly():
+    r = requests.get(f"{INTERNAL_ADMIN_BASE}/debug/config", timeout=5)
     assert r.status_code == 403
 
 
