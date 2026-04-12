@@ -3,7 +3,7 @@ services:
     build: ./gateway
     container_name: gateway
     ports:
-      - "8080:5000"
+      - "18080:5000"
     environment:
       APP_ENV: dev
       ALLOWED_PROXY_HOSTS: internal-admin
