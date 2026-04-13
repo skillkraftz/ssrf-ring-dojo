@@ -3,6 +3,8 @@
 This lab is an intentionally vulnerable local Docker Compose environment for
 security evaluation and remediation work.
 
+**This repository includes intentionally generated test certificates and private keys for local mTLS simulation. These are not production secrets and should not be reused outside this lab environment.**
+
 ## Services
 - gateway: externally exposed SSRF surface and one intended internal dependency
 - internal-admin: internal-only admin service with a legacy token-handling flaw
