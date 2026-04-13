@@ -8,11 +8,16 @@ app = Flask(__name__)
 
 SERVICE_ID = os.getenv("SERVICE_ID", "internal-admin")
 TOKEN_ISSUER = os.getenv("TOKEN_ISSUER", "token-service")
-ACCESS_TOKEN_SIGNING_SECRET = os.getenv(
-    "ACCESS_TOKEN_SIGNING_SECRET", "dev-access-token-signing-secret"
+TOKEN_SIGNING_PUBLIC_KEY_PATH = os.getenv(
+    "TOKEN_SIGNING_PUBLIC_KEY_PATH", "/keys/token-service-public.pem"
 )
 MAX_CLOCK_SKEW_SECONDS = 5
 USED_ACCESS_TOKEN_JTIS = {}
+ALLOWED_SUBJECTS_BY_SCOPE = {
+    "admin.export.read": {"admin-exporter"},
+    "debug.config.read": {"admin-observer"},
+    "internal.metrics.read": {"admin-observer"},
+}
 
 
 def _prune_used_jtis(cache: dict):
@@ -42,17 +47,21 @@ def _read_access_token() -> str:
 
 
 def _authorize(required_scope: str):
-    payload = verify_signed_payload(_read_access_token(), ACCESS_TOKEN_SIGNING_SECRET)
+    payload = verify_signed_payload(_read_access_token(), TOKEN_SIGNING_PUBLIC_KEY_PATH)
     now = now_epoch()
 
+    if payload.get("kind") != "access_token":
+        raise AuthError("bad token kind")
     if payload.get("iss") != TOKEN_ISSUER:
         raise AuthError("bad issuer")
     if payload.get("aud") != SERVICE_ID:
         raise AuthError("bad audience")
     if payload.get("scope") != required_scope:
         raise AuthError("insufficient scope")
-    if not payload.get("sub"):
-        raise AuthError("missing subject")
+
+    subject = payload.get("sub", "")
+    if subject not in ALLOWED_SUBJECTS_BY_SCOPE.get(required_scope, set()):
+        raise AuthError("wrong subject")
 
     try:
         expires_at = int(payload.get("exp", 0))
@@ -91,9 +100,9 @@ def debug_config():
     return jsonify(
         {
             "service": "internal-admin",
-            "note": "debug requires scoped bearer token",
+            "note": "debug requires observer bearer token",
             "env": os.getenv("APP_ENV", "dev"),
-            "feature_flags": ["metrics", "scoped_service_tokens"],
+            "feature_flags": ["metrics", "asymmetric_service_tokens"],
         }
     )
 

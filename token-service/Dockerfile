@@ -6,7 +6,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared ./shared
 COPY token-service/app.py .
-COPY token-service/tests ./tests
+COPY keys/token-service-private.pem /keys/token-service-private.pem
+COPY keys/admin-exporter-public.pem /keys/admin-exporter-public.pem
+COPY keys/admin-observer-public.pem /keys/admin-observer-public.pem
 
 EXPOSE 5003
 CMD ["python", "app.py"]

@@ -10,10 +10,8 @@ services:
       ALLOWED_PROXY_URLS: http://internal-admin:5001/health
     depends_on:
       - internal-admin
-      - redirector
-      - token-service
     networks:
-      - ring
+      - gateway-ring
 
   internal-admin:
     build:
@@ -24,11 +22,12 @@ services:
       APP_ENV: dev
       SERVICE_ID: internal-admin
       TOKEN_ISSUER: token-service
-      ACCESS_TOKEN_SIGNING_SECRET: dojo-access-token-signing-secret
+      TOKEN_SIGNING_PUBLIC_KEY_PATH: /keys/token-service-public.pem
     expose:
       - "5001"
     networks:
-      - ring
+      - gateway-ring
+      - service-ring
 
   redirector:
     build: ./redirector
@@ -36,7 +35,7 @@ services:
     expose:
       - "5002"
     networks:
-      - ring
+      - service-ring
 
   token-service:
     build:
@@ -46,14 +45,28 @@ services:
     environment:
       APP_ENV: dev
       TOKEN_ISSUER: token-service
-      ACCESS_TOKEN_SIGNING_SECRET: dojo-access-token-signing-secret
-      INTERNAL_ADMIN_CLIENT_ID: internal-admin
-      INTERNAL_ADMIN_CLIENT_SECRET: dojo-internal-admin-client-secret
+      TOKEN_SIGNING_PRIVATE_KEY_PATH: /keys/token-service-private.pem
+      ADMIN_EXPORTER_PUBLIC_KEY_PATH: /keys/admin-exporter-public.pem
+      ADMIN_OBSERVER_PUBLIC_KEY_PATH: /keys/admin-observer-public.pem
     expose:
       - "5003"
     networks:
-      - ring
+      - service-ring
+
+  ops-client:
+    build:
+      context: .
+      dockerfile: ops-client/Dockerfile
+    profiles:
+      - verify
+    depends_on:
+      - internal-admin
+      - token-service
+    networks:
+      - service-ring
 
 networks:
-  ring:
+  gateway-ring:
+    driver: bridge
+  service-ring:
     driver: bridge

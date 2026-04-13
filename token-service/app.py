@@ -15,29 +15,32 @@ from shared.auth import (
 app = Flask(__name__)
 
 TOKEN_ISSUER = os.getenv("TOKEN_ISSUER", "token-service")
-ACCESS_TOKEN_SIGNING_SECRET = os.getenv(
-    "ACCESS_TOKEN_SIGNING_SECRET", "dev-access-token-signing-secret"
+TOKEN_SIGNING_PRIVATE_KEY_PATH = os.getenv(
+    "TOKEN_SIGNING_PRIVATE_KEY_PATH", "/keys/token-service-private.pem"
 )
 ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "60"))
-ASSERTION_TTL_SECONDS = int(os.getenv("ASSERTION_TTL_SECONDS", "30"))
-INTERNAL_ADMIN_CLIENT_ID = os.getenv("INTERNAL_ADMIN_CLIENT_ID", "internal-admin")
-INTERNAL_ADMIN_CLIENT_SECRET = os.getenv(
-    "INTERNAL_ADMIN_CLIENT_SECRET", "dev-internal-admin-client-secret"
-)
 MAX_CLOCK_SKEW_SECONDS = 5
 USED_ASSERTION_JTIS = {}
 
 SERVICE_POLICIES = {
-    INTERNAL_ADMIN_CLIENT_ID: {
-        "secret": INTERNAL_ADMIN_CLIENT_SECRET,
+    "admin-exporter": {
+        "public_key_path": os.getenv(
+            "ADMIN_EXPORTER_PUBLIC_KEY_PATH", "/keys/admin-exporter-public.pem"
+        ),
+        "audiences": {"internal-admin"},
+        "scopes": {"admin.export.read"},
+    },
+    "admin-observer": {
+        "public_key_path": os.getenv(
+            "ADMIN_OBSERVER_PUBLIC_KEY_PATH", "/keys/admin-observer-public.pem"
+        ),
         "audiences": {"internal-admin"},
         "scopes": {
-            "admin.export.read",
             "debug.config.read",
             "internal.metrics.read",
             "token.discovery",
         },
-    }
+    },
 }
 
 
@@ -83,10 +86,12 @@ def _verify_service_assertion(
     preview = peek_signed_payload(assertion)
     service_id = preview.get("sub", "")
     policy = _load_policy(service_id)
-    payload = verify_signed_payload(assertion, policy["secret"])
+    payload = verify_signed_payload(assertion, policy["public_key_path"])
 
     now = now_epoch()
-    if payload.get("iss") != service_id:
+    if payload.get("kind") != "service_assertion":
+        raise AuthError("bad token kind")
+    if payload.get("iss") != service_id or payload.get("sub") != service_id:
         raise AuthError("bad issuer")
     if payload.get("aud") != TOKEN_ISSUER:
         raise AuthError("bad audience")
@@ -114,6 +119,7 @@ def _issue_access_token(service_id: str, audience: str, scope: str) -> str:
     now = now_epoch()
     return issue_signed_payload(
         {
+            "kind": "access_token",
             "iss": TOKEN_ISSUER,
             "sub": service_id,
             "aud": audience,
@@ -123,26 +129,7 @@ def _issue_access_token(service_id: str, audience: str, scope: str) -> str:
             "jti": new_jti(),
             "one_time": True,
         },
-        ACCESS_TOKEN_SIGNING_SECRET,
-    )
-
-
-def issue_service_assertion(
-    service_id: str, service_secret: str, audience: str, scope: str
-) -> str:
-    now = now_epoch()
-    return issue_signed_payload(
-        {
-            "iss": service_id,
-            "sub": service_id,
-            "aud": TOKEN_ISSUER,
-            "request_aud": audience,
-            "request_scope": scope,
-            "iat": now,
-            "exp": now + ASSERTION_TTL_SECONDS,
-            "jti": new_jti(),
-        },
-        service_secret,
+        TOKEN_SIGNING_PRIVATE_KEY_PATH,
     )
 
 
@@ -163,7 +150,7 @@ def mesh():
         {
             "service": "token-service",
             "issuer": TOKEN_ISSUER,
-            "mode": "scoped-service-tokens",
+            "mode": "ed25519-scoped-tokens",
         }
     )
 

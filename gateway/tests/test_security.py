@@ -70,28 +70,14 @@ def test_allowlisted_proxy_cannot_be_abused_for_other_internal_url():
     assert r.status_code == 403
 
 
-def test_token_service_discovery_requires_assertion_directly():
-    r = requests.get(f"{TOKEN_SERVICE_BASE}/.well-known/mesh", timeout=5)
-    assert r.status_code == 403
+def test_gateway_cannot_resolve_token_service_directly():
+    with pytest.raises(socket.gaierror):
+        socket.getaddrinfo("token-service", 5003)
 
 
-def test_token_service_mint_requires_service_assertion_directly():
-    r = requests.get(
-        f"{TOKEN_SERVICE_BASE}/mint",
-        params={"aud": "internal-admin", "scope": "admin.export.read"},
-        timeout=5,
-    )
-    assert r.status_code == 403
-
-
-def test_token_service_rejects_forged_service_assertion_directly():
-    r = requests.get(
-        f"{TOKEN_SERVICE_BASE}/mint",
-        params={"aud": "internal-admin", "scope": "admin.export.read"},
-        headers={"X-Service-Assertion": "bogus"},
-        timeout=5,
-    )
-    assert r.status_code == 403
+def test_gateway_cannot_resolve_redirector_directly():
+    with pytest.raises(socket.gaierror):
+        socket.getaddrinfo("redirector", 5002)
 
 
 def test_internal_metrics_require_bearer_token_directly():

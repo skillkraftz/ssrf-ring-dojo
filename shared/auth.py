@@ -1,10 +1,17 @@
 import base64
 import binascii
-import hashlib
-import hmac
 import json
 import secrets
 import time
+from functools import lru_cache
+from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 
 class AuthError(ValueError):
@@ -35,12 +42,59 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
-def peek_signed_payload(token: str) -> dict:
+def _split_token(token: str) -> tuple[str, str]:
+    parts = token.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise AuthError("bad token")
+    return parts[0], parts[1]
+
+
+@lru_cache(maxsize=None)
+def _load_private_key(path: str) -> Ed25519PrivateKey:
     try:
-        payload_b64, _ = token.split(".", 1)
+        raw_key = Path(path).read_bytes()
+        key = serialization.load_pem_private_key(raw_key, password=None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise AuthError("bad private key") from exc
+
+    if not isinstance(key, Ed25519PrivateKey):
+        raise AuthError("unsupported private key")
+
+    return key
+
+
+@lru_cache(maxsize=None)
+def _load_public_key(path: str) -> Ed25519PublicKey:
+    try:
+        raw_key = Path(path).read_bytes()
+        key = serialization.load_pem_public_key(raw_key)
+    except (OSError, ValueError, TypeError) as exc:
+        raise AuthError("bad public key") from exc
+
+    if not isinstance(key, Ed25519PublicKey):
+        raise AuthError("unsupported public key")
+
+    return key
+
+
+def _coerce_private_key(signing_key) -> Ed25519PrivateKey:
+    if isinstance(signing_key, Ed25519PrivateKey):
+        return signing_key
+    return _load_private_key(str(signing_key))
+
+
+def _coerce_public_key(verification_key) -> Ed25519PublicKey:
+    if isinstance(verification_key, Ed25519PublicKey):
+        return verification_key
+    return _load_public_key(str(verification_key))
+
+
+def peek_signed_payload(token: str) -> dict:
+    payload_b64, _ = _split_token(token)
+
+    try:
         return json.loads(_b64url_decode(payload_b64).decode("utf-8"))
     except (
-        ValueError,
         json.JSONDecodeError,
         UnicodeDecodeError,
         binascii.Error,
@@ -48,30 +102,29 @@ def peek_signed_payload(token: str) -> dict:
         raise AuthError("bad token") from exc
 
 
-def issue_signed_payload(payload: dict, signing_secret: str) -> str:
+def issue_signed_payload(payload: dict, signing_key) -> str:
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8"
     )
     payload_b64 = _b64url_encode(payload_json)
-    signature = hmac.new(
-        signing_secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256
-    ).digest()
+    signature = _coerce_private_key(signing_key).sign(payload_b64.encode("ascii"))
     return f"{payload_b64}.{_b64url_encode(signature)}"
 
 
-def verify_signed_payload(token: str, signing_secret: str) -> dict:
-    try:
-        payload_b64, signature_b64 = token.split(".", 1)
-    except ValueError as exc:
-        raise AuthError("bad token") from exc
+def verify_signed_payload(token: str, verification_key) -> dict:
+    payload_b64, signature_b64 = _split_token(token)
 
-    expected_signature = _b64url_encode(
-        hmac.new(
-            signing_secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256
-        ).digest()
-    )
-    if not hmac.compare_digest(signature_b64, expected_signature):
-        raise AuthError("bad signature")
+    try:
+        signature = _b64url_decode(signature_b64)
+    except binascii.Error as exc:
+        raise AuthError("bad signature") from exc
+
+    try:
+        _coerce_public_key(verification_key).verify(
+            signature, payload_b64.encode("ascii")
+        )
+    except InvalidSignature as exc:
+        raise AuthError("bad signature") from exc
 
     try:
         return json.loads(_b64url_decode(payload_b64).decode("utf-8"))
