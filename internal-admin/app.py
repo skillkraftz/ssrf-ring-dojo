@@ -3,14 +3,24 @@ import os
 from flask import Flask, jsonify, request
 
 from shared.auth import AuthError, now_epoch, verify_signed_payload
+from shared.mtls import build_server_ssl_context, serve_http_and_mtls
 
 app = Flask(__name__)
 
 SERVICE_ID = os.getenv("SERVICE_ID", "internal-admin")
 TOKEN_ISSUER = os.getenv("TOKEN_ISSUER", "token-service")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "5001"))
+HTTPS_PORT = int(os.getenv("HTTPS_PORT", "5443"))
 TOKEN_SIGNING_PUBLIC_KEY_PATH = os.getenv(
     "TOKEN_SIGNING_PUBLIC_KEY_PATH", "/keys/token-service-public.pem"
 )
+TLS_SERVER_CERT_PATH = os.getenv(
+    "TLS_SERVER_CERT_PATH", "/tls/internal-admin-server-cert.pem"
+)
+TLS_SERVER_KEY_PATH = os.getenv(
+    "TLS_SERVER_KEY_PATH", "/tls/internal-admin-server-key.pem"
+)
+TLS_CA_CERT_PATH = os.getenv("TLS_CA_CERT_PATH", "/tls/ca-cert.pem")
 PROOF_TTL_SECONDS = int(os.getenv("PROOF_TTL_SECONDS", "15"))
 MAX_CLOCK_SKEW_SECONDS = 5
 USED_ACCESS_TOKEN_JTIS = {}
@@ -72,6 +82,15 @@ def _read_service_proof() -> str:
     if not proof:
         raise AuthError("missing service proof")
     return proof
+
+
+def _require_mtls_subject(expected_subject: str):
+    if not request.environ.get("mtls.client_verified"):
+        raise AuthError("mTLS required")
+
+    client_subject = request.environ.get("mtls.client_common_name", "")
+    if client_subject != expected_subject:
+        raise AuthError("client subject mismatch")
 
 
 def _validate_service_proof(subject: str, token_jti: str):
@@ -140,6 +159,7 @@ def _authorize(required_scope: str):
     if issued_at > now + MAX_CLOCK_SKEW_SECONDS:
         raise AuthError("token from the future")
 
+    _require_mtls_subject(subject)
     _validate_service_proof(subject, payload.get("jti", ""))
 
     if payload.get("one_time") is True:
@@ -210,4 +230,9 @@ def admin_export():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+    ssl_context = build_server_ssl_context(
+        TLS_SERVER_CERT_PATH,
+        TLS_SERVER_KEY_PATH,
+        TLS_CA_CERT_PATH,
+    )
+    serve_http_and_mtls(app, HTTP_PORT, HTTPS_PORT, ssl_context)

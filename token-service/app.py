@@ -11,13 +11,23 @@ from shared.auth import (
     peek_signed_payload,
     verify_signed_payload,
 )
+from shared.mtls import build_server_ssl_context, serve_http_and_mtls
 
 app = Flask(__name__)
 
 TOKEN_ISSUER = os.getenv("TOKEN_ISSUER", "token-service")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "5003"))
+HTTPS_PORT = int(os.getenv("HTTPS_PORT", "5443"))
 TOKEN_SIGNING_PRIVATE_KEY_PATH = os.getenv(
     "TOKEN_SIGNING_PRIVATE_KEY_PATH", "/keys/token-service-private.pem"
 )
+TLS_SERVER_CERT_PATH = os.getenv(
+    "TLS_SERVER_CERT_PATH", "/tls/token-service-server-cert.pem"
+)
+TLS_SERVER_KEY_PATH = os.getenv(
+    "TLS_SERVER_KEY_PATH", "/tls/token-service-server-key.pem"
+)
+TLS_CA_CERT_PATH = os.getenv("TLS_CA_CERT_PATH", "/tls/ca-cert.pem")
 ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "60"))
 MAX_CLOCK_SKEW_SECONDS = 5
 USED_ASSERTION_JTIS = {}
@@ -75,6 +85,15 @@ def _bad_request(message: str):
     return jsonify({"error": message}), 400
 
 
+def _require_mtls_subject(expected_subject: str):
+    if not request.environ.get("mtls.client_verified"):
+        raise AuthError("mTLS required")
+
+    client_subject = request.environ.get("mtls.client_common_name", "")
+    if client_subject != expected_subject:
+        raise AuthError("client subject mismatch")
+
+
 def _verify_service_assertion(
     assertion: str, requested_audience: str, requested_scope: str
 ):
@@ -84,6 +103,7 @@ def _verify_service_assertion(
     preview = peek_signed_payload(assertion)
     service_id = preview.get("sub", "")
     policy = _load_policy(service_id)
+    _require_mtls_subject(service_id)
     payload = verify_signed_payload(assertion, policy["public_key_path"])
 
     now = now_epoch()
@@ -184,4 +204,9 @@ def mint():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5003)
+    ssl_context = build_server_ssl_context(
+        TLS_SERVER_CERT_PATH,
+        TLS_SERVER_KEY_PATH,
+        TLS_CA_CERT_PATH,
+    )
+    serve_http_and_mtls(app, HTTP_PORT, HTTPS_PORT, ssl_context)

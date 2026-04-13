@@ -22,11 +22,17 @@ services:
       APP_ENV: dev
       SERVICE_ID: internal-admin
       TOKEN_ISSUER: token-service
+      HTTP_PORT: 5001
+      HTTPS_PORT: 5443
       TOKEN_SIGNING_PUBLIC_KEY_PATH: /keys/token-service-public.pem
+      TLS_SERVER_CERT_PATH: /tls/internal-admin-server-cert.pem
+      TLS_SERVER_KEY_PATH: /tls/internal-admin-server-key.pem
+      TLS_CA_CERT_PATH: /tls/ca-cert.pem
       ADMIN_EXPORTER_PUBLIC_KEY_PATH: /keys/admin-exporter-public.pem
       ADMIN_OBSERVER_PUBLIC_KEY_PATH: /keys/admin-observer-public.pem
     expose:
       - "5001"
+      - "5443"
     networks:
       - gateway-ring
       - service-ring
@@ -47,11 +53,17 @@ services:
     environment:
       APP_ENV: dev
       TOKEN_ISSUER: token-service
+      HTTP_PORT: 5003
+      HTTPS_PORT: 5443
       TOKEN_SIGNING_PRIVATE_KEY_PATH: /keys/token-service-private.pem
+      TLS_SERVER_CERT_PATH: /tls/token-service-server-cert.pem
+      TLS_SERVER_KEY_PATH: /tls/token-service-server-key.pem
+      TLS_CA_CERT_PATH: /tls/ca-cert.pem
       ADMIN_EXPORTER_PUBLIC_KEY_PATH: /keys/admin-exporter-public.pem
       ADMIN_OBSERVER_PUBLIC_KEY_PATH: /keys/admin-observer-public.pem
     expose:
       - "5003"
+      - "5443"
     networks:
       - service-ring
 

@@ -90,6 +90,15 @@ def test_debug_config_requires_bearer_token_directly():
     assert r.status_code == 403
 
 
+def test_gateway_cannot_use_internal_admin_mtls_port():
+    with pytest.raises(requests.exceptions.SSLError):
+        requests.get(
+            "https://internal-admin:5443/admin/export",
+            verify=False,
+            timeout=5,
+        )
+
+
 def test_legacy_query_token_export_rejected_directly():
     r = requests.get(
         f"{INTERNAL_ADMIN_BASE}/admin/export",

@@ -8,5 +8,8 @@ COPY shared ./shared
 COPY ops-client/tests ./tests
 COPY keys/admin-exporter-private.pem /keys/admin-exporter-private.pem
 COPY keys/admin-observer-private.pem /keys/admin-observer-private.pem
+COPY tls/ca-cert.pem /tls/ca-cert.pem
+COPY tls/admin-exporter-client-cert.pem /tls/admin-exporter-client-cert.pem
+COPY tls/admin-observer-client-cert.pem /tls/admin-observer-client-cert.pem
 
 CMD ["python", "-c", "import time; time.sleep(10**9)"]
