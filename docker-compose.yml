@@ -23,6 +23,8 @@ services:
       SERVICE_ID: internal-admin
       TOKEN_ISSUER: token-service
       TOKEN_SIGNING_PUBLIC_KEY_PATH: /keys/token-service-public.pem
+      ADMIN_EXPORTER_PUBLIC_KEY_PATH: /keys/admin-exporter-public.pem
+      ADMIN_OBSERVER_PUBLIC_KEY_PATH: /keys/admin-observer-public.pem
     expose:
       - "5001"
     networks:
@@ -70,3 +72,4 @@ networks:
     driver: bridge
   service-ring:
     driver: bridge
+    internal: true

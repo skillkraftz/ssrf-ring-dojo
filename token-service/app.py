@@ -27,18 +27,16 @@ SERVICE_POLICIES = {
         "public_key_path": os.getenv(
             "ADMIN_EXPORTER_PUBLIC_KEY_PATH", "/keys/admin-exporter-public.pem"
         ),
-        "audiences": {"internal-admin"},
-        "scopes": {"admin.export.read"},
+        "permissions": {("internal-admin", "admin.export.read")},
     },
     "admin-observer": {
         "public_key_path": os.getenv(
             "ADMIN_OBSERVER_PUBLIC_KEY_PATH", "/keys/admin-observer-public.pem"
         ),
-        "audiences": {"internal-admin"},
-        "scopes": {
-            "debug.config.read",
-            "internal.metrics.read",
-            "token.discovery",
+        "permissions": {
+            ("internal-admin", "debug.config.read"),
+            ("internal-admin", "internal.metrics.read"),
+            (TOKEN_ISSUER, "token.discovery"),
         },
     },
 }
@@ -99,6 +97,8 @@ def _verify_service_assertion(
         raise AuthError("audience mismatch")
     if payload.get("request_scope") != requested_scope:
         raise AuthError("scope mismatch")
+    if (requested_audience, requested_scope) not in policy["permissions"]:
+        raise AuthError("permission not allowed")
 
     try:
         expires_at = int(payload.get("exp", 0))
@@ -170,9 +170,6 @@ def mint():
     try:
         payload, policy = _verify_service_assertion(assertion, audience, scope)
     except AuthError:
-        return _forbidden()
-
-    if audience not in policy["audiences"] or scope not in policy["scopes"]:
         return _forbidden()
 
     service_id = payload["sub"]
